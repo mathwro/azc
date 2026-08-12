@@ -66,7 +66,9 @@ OPTIONS:
 
 INTERACTIVE KEYS:
     Type                Filter immediately
-    Up/Down, Ctrl+P/N   Move selection
+    Up/Down             Move selection
+    Alt+j/k             Move selection (Vim)
+    Ctrl+P/N            Move selection (Emacs)
     Home/End            Jump to first/last match
     Enter               Switch to selected subscription
     Esc, Ctrl+C         Cancel

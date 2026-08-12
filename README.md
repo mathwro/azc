@@ -27,7 +27,19 @@ Changing subscriptions with the Azure CLI normally means listing accounts, findi
 - Windows PowerShell/Windows Terminal, a Linux terminal, or a macOS terminal
 - Rust 1.85 or newer when installing from source
 
-## Install from source
+## Install
+
+### Directly from GitHub
+
+Cargo can build and install a binary directly from a Git repository:
+
+```sh
+cargo install --git https://github.com/mathwro/azc.git
+```
+
+This is the Rust equivalent of installing a Go command from its repository. It checks out the repository, builds the release binary, and places `azc` in Cargo's binary directory.
+
+### From a local checkout
 
 From the project directory:
 
@@ -35,7 +47,7 @@ From the project directory:
 cargo install --path .
 ```
 
-Cargo installs `azc` into its binary directory, normally `$HOME/.cargo/bin` on Linux and macOS or `%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on `PATH`.
+Cargo normally installs binaries to `$HOME/.cargo/bin` on Linux and macOS or `%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on `PATH`. See the [`cargo install` reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html) for Git tags, branches, and revisions.
 
 Then authenticate and launch:
 
@@ -57,7 +69,7 @@ Run `azc` without a query. Printable characters immediately filter subscription 
 | Key | Action |
 | --- | --- |
 | Type or paste | Filter subscriptions |
-| `Up` / `Down` | Move the selection |
+| `Up` / `Down`, `Alt+j` / `Alt+k` | Move the selection |
 | `Ctrl+P` / `Ctrl+N` | Move the selection |
 | `Home` / `End` | Jump to the first / last match |
 | `Enter` | Switch to the selected subscription |

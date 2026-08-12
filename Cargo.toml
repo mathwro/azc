@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "A fast subscription context switcher for Azure CLI"
 license = "MIT"
+repository = "https://github.com/mathwro/azc"
 keywords = ["azure", "cli", "tui", "subscription"]
 categories = ["command-line-utilities"]
 

@@ -5,6 +5,7 @@
 `azc` is a small Rust executable for changing the active Azure CLI subscription. Preserve these invariants:
 
 - `azc` with no query enters the TUI and accepts printable search input immediately. There is no normal/insert mode.
+- Vim-style navigation uses `Alt+j` / `Alt+k`, leaving plain `j` and `k` available to search.
 - The TUI renders before `az account list` completes; subscription loading remains off the terminal event thread.
 - Interactive mode changes context only after `Enter`. `Esc` and `Ctrl+C` leave context unchanged.
 - Direct mode (`azc <query>`) switches only when the best match is unique. Equal-ranked matches return an ambiguity error rather than guessing.
@@ -44,7 +45,7 @@ az account set --subscription <id> --only-show-errors
 - Keep dependencies small; a new crate must remove more code or risk than it adds.
 - Restore the terminal on every non-abort return path. Changes around initialization, panic handling, or event errors require a real PTY smoke check.
 - Accept `KeyEventKind::Press` and repeat events while ignoring release events; Windows terminals emit release events.
-- Keep every printable character available for search. Quit/navigation shortcuts use non-printable keys or control modifiers.
+- Keep every printable character available for search. Navigation shortcuts use non-printable keys, control modifiers, or `Alt`.
 - Preserve deterministic ordering: match score, current subscription, case-insensitive name, then source order.
 - User errors use the `azc: <detail>` stderr prefix and a nonzero exit code. Cancellation is successful and silent.
 - Update `cli::help()` and `README.md` together when flags, controls, environment variables, or matching semantics change.

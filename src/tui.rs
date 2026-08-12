@@ -121,6 +121,20 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('j') => {
+                    self.next();
+                    return None;
+                }
+                KeyCode::Char('k') => {
+                    self.previous();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Some(Action::Cancel),
@@ -350,11 +364,11 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let status = if let Some(selected) = app.selected() {
         format!(
-            " Enter switch · ↑/↓ navigate · Esc cancel    tenant {} ",
+            " Enter switch · ↑/↓ or Alt+j/k navigate · Esc cancel    tenant {} ",
             selected.tenant_id
         )
     } else {
-        " Type to search · ↑/↓ navigate · Esc cancel ".to_owned()
+        " Type to search · ↑/↓ or Alt+j/k navigate · Esc cancel ".to_owned()
     };
     frame.render_widget(
         Paragraph::new(status).style(Style::new().fg(Color::DarkGray)),
@@ -442,6 +456,22 @@ mod tests {
         assert_eq!(app.selected().unwrap().name, "HR Production");
         app.next();
         assert_eq!(app.selected().unwrap().name, "HR Development");
+    }
+
+    #[test]
+    fn alt_j_and_k_navigate_without_becoming_search_text() {
+        let mut app = loaded_app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT));
+        assert_eq!(app.selected().unwrap().name, "HR Development");
+        assert_eq!(app.query, "");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
+        assert_eq!(app.selected().unwrap().name, "Finance");
+        assert_eq!(app.query, "");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.query, "j");
     }
 
     #[test]
