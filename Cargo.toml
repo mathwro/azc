@@ -1,0 +1,20 @@
+[package]
+name = "azc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A fast subscription context switcher for Azure CLI"
+license = "MIT"
+keywords = ["azure", "cli", "tui", "subscription"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+ratatui = "0.30.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-width = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
