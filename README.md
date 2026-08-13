@@ -8,6 +8,8 @@ azc hr               # switch to the unique best match for "hr"
 azc human resources  # queries may contain multiple unquoted words
 azc --refresh        # refresh subscriptions from Azure, then open the picker
 azc --refresh hr     # refresh, then switch by query
+azc version          # print the installed version
+azc update           # update to the latest GitHub version
 ```
 
 ## Why azc
@@ -25,7 +27,7 @@ Changing subscriptions with the Azure CLI normally means listing accounts, findi
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) installed and available on `PATH`
 - An authenticated Azure CLI session created with `az login`
 - Windows PowerShell/Windows Terminal, a Linux terminal, or a macOS terminal
-- Rust 1.85 or newer when installing from source
+- Rust 1.85 or newer, including Cargo, when installing or using `azc update`
 
 ## Install
 
@@ -62,6 +64,28 @@ For local development without installing:
 cargo run -- hr
 ```
 
+## Version and updates
+
+Print the installed version:
+
+```sh
+azc version
+```
+
+Update to the latest version from the repository's default branch:
+
+```sh
+azc update
+```
+
+The update command runs:
+
+```sh
+cargo install --git https://github.com/mathwro/azc --locked --force
+```
+
+It therefore requires Cargo, network access to GitHub, and permission to write to Cargo's binary directory. On Windows, `azc` starts Cargo and exits so that Cargo can replace the running executable; keep the terminal open until Cargo finishes.
+
 ## Interactive picker
 
 Run `azc` without a query. Printable characters immediately filter subscription names, subscription IDs, and tenant IDs.
@@ -96,7 +120,7 @@ $ azc hr
 Switched to HR Production (00000000-0000-0000-0000-000000000002)
 ```
 
-If multiple subscriptions tie at the best rank, `azc` exits without changing context and lists the ambiguous names. Use a longer query or open the picker.
+If multiple subscriptions tie at the best rank, `azc` exits without changing context and lists the ambiguous names. Use a longer query or open the picker. `update` and `version` are command names; search for subscriptions with those exact names using `azc -- update` or `azc -- version`.
 
 ## Azure CLI behavior
 
@@ -167,7 +191,8 @@ src/
 ├── main.rs     Mode dispatch and exit behavior
 ├── matcher.rs  Shared ranking and unique-match selection
 ├── model.rs    Azure subscription JSON model
-└── tui.rs      Background loading, input handling, and rendering
+├── tui.rs      Background loading, input handling, and rendering
+└── updater.rs  Cargo-based updates and update error reporting
 ```
 
 ## Development

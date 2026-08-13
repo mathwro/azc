@@ -4,20 +4,32 @@ use std::{error::Error, ffi::OsString, fmt};
 pub enum Command {
     Interactive { refresh: bool },
     Switch { query: String, refresh: bool },
+    Update,
     Help,
     Version,
 }
 
 pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let arguments = arguments
+        .into_iter()
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| CliError("arguments must be valid Unicode".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match arguments.as_slice() {
+        [argument] if argument == "update" => return Ok(Command::Update),
+        [argument] if argument == "version" => return Ok(Command::Version),
+        _ => {}
+    }
+
     let mut refresh = false;
     let mut positional_only = false;
     let mut query_parts = Vec::new();
 
     for argument in arguments {
-        let argument = argument
-            .into_string()
-            .map_err(|_| CliError("arguments must be valid Unicode".to_owned()))?;
-
         if positional_only {
             query_parts.push(argument);
             continue;
@@ -53,16 +65,17 @@ pub fn help() -> &'static str {
 USAGE:
     azc [OPTIONS] [QUERY...]
 
-MODES:
+COMMANDS:
     azc                 Open the searchable subscription list
-    azc hr              Switch to the unique best match for 'hr'
-    azc human resources Switch using a multi-word query
+    azc <query>         Switch to the unique best subscription match
+    azc update          Reinstall the latest version from GitHub
+    azc version         Print the installed version
 
 OPTIONS:
     -r, --refresh       Refresh subscriptions from Azure before listing
     -h, --help          Print help
     -V, --version       Print version
-    --                  Treat remaining arguments as the query
+    --                  Treat remaining arguments as a query, including command names
 
 INTERACTIVE KEYS:
     Type                Filter immediately
@@ -125,6 +138,30 @@ mod tests {
             parse(args(&["--", "-sandbox"])).unwrap(),
             Command::Switch {
                 query: "-sandbox".to_owned(),
+                refresh: false,
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_update_and_version_commands() {
+        assert_eq!(parse(args(&["update"])).unwrap(), Command::Update);
+        assert_eq!(parse(args(&["version"])).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn separator_allows_reserved_words_as_queries() {
+        assert_eq!(
+            parse(args(&["--", "update"])).unwrap(),
+            Command::Switch {
+                query: "update".to_owned(),
+                refresh: false,
+            }
+        );
+        assert_eq!(
+            parse(args(&["--", "version"])).unwrap(),
+            Command::Switch {
+                query: "version".to_owned(),
                 refresh: false,
             }
         );

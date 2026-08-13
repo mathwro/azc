@@ -3,6 +3,7 @@ mod cli;
 mod matcher;
 mod model;
 mod tui;
+mod updater;
 
 use std::{env, error::Error, process::ExitCode};
 
@@ -26,6 +27,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     match command {
         Command::Help => print!("{}", cli::help()),
         Command::Version => println!("azc {}", env!("CARGO_PKG_VERSION")),
+        Command::Update => match updater::update()? {
+            #[cfg(not(target_os = "windows"))]
+            updater::UpdateOutcome::Completed => println!("azc updated successfully"),
+            #[cfg(target_os = "windows")]
+            updater::UpdateOutcome::Started => {
+                println!("Cargo update started; keep this terminal open until it finishes")
+            }
+        },
         Command::Interactive { refresh } => {
             let azure = AzureCli::from_env();
             if let Some(subscription) = tui::choose_subscription(azure.clone(), refresh)? {
