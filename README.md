@@ -222,14 +222,11 @@ The project-specific contribution and verification contracts are in [`AGENTS.md`
 
 ## Releasing
 
-`release.toml` is the canonical package and target metadata. Releases require an annotated or signed tag named exactly `vX.Y.Z`, where `X.Y.Z` equals the version in `Cargo.toml`. Before tagging, merge the release commit to protected `main`, pass the `CI` required check, and configure the `release` environment for maintainer approval.
+`release.json` selects the typed Rust adapter and stable package/binary identity. The shared `mathwro/homebrew-tools/.github/workflows/release-tool.yml@main` workflow owns Rust testing, target setup, native builds, packaging, checksums, publication, and distribution notification. The release tag version must equal the version in `Cargo.toml`.
 
-Dry-run the exact tagged source before publication:
+Before the first release, merge the shared workflow into `mathwro/homebrew-tools`, require the `CI` and `Workflow Lint` checks in `main` branch protection, create the protected `release` environment with required reviewers, and configure the `DISTRIBUTION_DISPATCH_TOKEN` repository secret. The token must be limited to sending repository dispatches to `mathwro/homebrew-tools`.
 
-1. Create a temporary annotated prerelease tag, for example `v0.1.0-rc.1`, on a commit whose `Cargo.toml` version is also `0.1.0-rc.1`.
-2. Push the tag.
-3. Run the `Release` workflow manually with that tag and `dry_run: true`.
-4. Confirm all six `release-*` artifacts and the complete staging artifact pass. No GitHub Release or package dispatch is created.
+For a complete dry run, set `Cargo.toml` to a prerelease version such as `0.1.0-rc.1`, merge it, and push the matching annotated tag. Prerelease tag pushes automatically run with `dry_run: true`: all six native archives and the complete staging artifact are produced, but no GitHub Release or package update is created. The workflow can also be dispatched manually for an existing tag.
 
 Publish a stable release:
 
@@ -240,9 +237,9 @@ git tag -a v0.1.0 -m "azc v0.1.0"
 git push origin v0.1.0
 ```
 
-The tag workflow builds with locked dependencies on six native GitHub-hosted runners, embeds the tagged commit and commit date, checks each root-only archive, generates and independently verifies `checksums.txt`, creates a draft, compares remote names and sizes, then publishes it. A successful publication dispatches one `package-release` event to `mathwro/homebrew-tools` with `repository`, `tag`, and `release_id`. Configure `DISTRIBUTION_REPOSITORY_TOKEN` as an environment secret scoped only to dispatch that repository.
+The stable tag run repeats the dry-run checks with locked dependencies and waits at the protected `release` environment before creating and publishing the immutable GitHub Release. Stable publication then calls the central notifier, which verifies the exact release and sends the canonical package update event.
 
-Release assets are immutable. Never move or recreate a consumed tag, and never replace an asset on a published release. For a defective asset, fix the source and publish a new patch version. An interrupted unpublished draft may be deleted and rerun only after confirming it was never published. A failed package dispatch does not alter the release; resolve the credential or destination issue and let distribution reconciliation rediscover it rather than republishing.
+Release assets are immutable. Never move or recreate a consumed tag, and never replace an asset on a published release. For a defective artifact, fix the source and publish a new patch version. A notification failure does not invalidate the release; distribution reconciliation discovers it without republishing.
 
 Release binaries have these platform properties:
 

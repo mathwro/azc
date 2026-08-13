@@ -1,10 +1,10 @@
 use std::{env, process::Command};
 
 fn main() {
-    println!("cargo::rerun-if-env-changed=AZC_COMMIT_SHA");
+    println!("cargo::rerun-if-env-changed=RELEASE_COMMIT");
     println!("cargo::rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
-    let commit = env::var("AZC_COMMIT_SHA")
+    let commit = env::var("RELEASE_COMMIT")
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| git_output(&["rev-parse", "HEAD"]))
