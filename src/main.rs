@@ -4,6 +4,7 @@ mod matcher;
 mod model;
 mod tui;
 mod updater;
+mod version;
 
 use std::{env, error::Error, process::ExitCode};
 
@@ -26,7 +27,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match command {
         Command::Help => print!("{}", cli::help()),
-        Command::Version => println!("azc {}", env!("CARGO_PKG_VERSION")),
+        Command::Version => println!("{}", version::Version),
         Command::Update => match updater::update()? {
             #[cfg(not(target_os = "windows"))]
             updater::UpdateOutcome::Completed => println!("azc updated successfully"),

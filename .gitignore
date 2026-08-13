@@ -1,3 +1,5 @@
 /target/
 .DS_Store
 *.pdb
+__pycache__/
+*.py[cod]

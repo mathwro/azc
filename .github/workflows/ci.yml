@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --locked
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build host binary
+        run: cargo build --locked
+      - name: Smoke-test immutable commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo run --locked --quiet -- --version)"
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          [[ "$version" == "azc $package_version (commit "*", built "????-??-??")" ]]
+          cargo run --locked --quiet -- --help >/dev/null
