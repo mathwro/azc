@@ -6,7 +6,7 @@ use std::{
     process::{Command, Output},
 };
 
-use crate::model::Subscription;
+use crate::model::{Subscription, TenantDescription};
 
 const AZURE_CLI_ENV: &str = "AZC_AZ_BIN";
 
@@ -31,6 +31,72 @@ impl AzureCli {
 
         let output = self.run(command, "az account list")?;
         serde_json::from_slice(&output.stdout).map_err(AzureError::InvalidAccountJson)
+    }
+
+    pub fn list_tenants(&self) -> Result<Vec<TenantDescription>, AzureError> {
+        let mut command = self.command();
+        command.args([
+            "rest",
+            "--method",
+            "get",
+            "--url",
+            "https://management.azure.com/tenants?api-version=2022-12-01",
+            "--query",
+            "value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain}",
+            "--output",
+            "json",
+        ]);
+
+        let output = self.run(command, "az rest tenant list")?;
+        let mut descriptions: Vec<TenantDescription> =
+            serde_json::from_slice(&output.stdout).map_err(AzureError::InvalidTenantJson)?;
+
+        let mut metadata_command = self.command();
+        metadata_command.args([
+            "account",
+            "list",
+            "--all",
+            "--query",
+            "[].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain}",
+            "--output",
+            "json",
+            "--only-show-errors",
+        ]);
+        let metadata_output = self.run(metadata_command, "az account list tenant metadata")?;
+        let metadata: Vec<TenantDescription> = serde_json::from_slice(&metadata_output.stdout)
+            .map_err(AzureError::InvalidTenantMetadataJson)?;
+
+        Self::merge_tenant_metadata(&mut descriptions, &metadata);
+
+        Ok(descriptions)
+    }
+
+    pub(crate) fn merge_tenant_metadata(
+        descriptions: &mut Vec<TenantDescription>,
+        metadata: &[TenantDescription],
+    ) {
+        for metadata in metadata {
+            if let Some(description) = descriptions.iter_mut().find(|description| {
+                description
+                    .tenant_id
+                    .trim()
+                    .eq_ignore_ascii_case(metadata.tenant_id.trim())
+            }) {
+                if (description.display_name.is_empty()
+                    || description
+                        .display_name
+                        .eq_ignore_ascii_case(description.tenant_id.trim()))
+                    && !metadata.display_name.is_empty()
+                {
+                    description.display_name = metadata.display_name.clone();
+                }
+                if description.default_domain.is_empty() && !metadata.default_domain.is_empty() {
+                    description.default_domain = metadata.default_domain.clone();
+                }
+            } else if !metadata.tenant_id.trim().is_empty() {
+                descriptions.push(metadata.clone());
+            }
+        }
     }
 
     pub fn set_subscription(&self, subscription_id: &str) -> Result<(), AzureError> {
@@ -122,6 +188,8 @@ pub enum AzureError {
         detail: String,
     },
     InvalidAccountJson(serde_json::Error),
+    InvalidTenantJson(serde_json::Error),
+    InvalidTenantMetadataJson(serde_json::Error),
 }
 
 impl fmt::Display for AzureError {
@@ -146,6 +214,15 @@ impl fmt::Display for AzureError {
             Self::InvalidAccountJson(source) => {
                 write!(f, "az account list returned invalid JSON: {source}")
             }
+            Self::InvalidTenantJson(source) => {
+                write!(f, "az rest tenant list returned invalid JSON: {source}")
+            }
+            Self::InvalidTenantMetadataJson(source) => {
+                write!(
+                    f,
+                    "az account list tenant metadata returned invalid JSON: {source}"
+                )
+            }
         }
     }
 }
@@ -155,7 +232,65 @@ impl Error for AzureError {
         match self {
             Self::Start { source, .. } => Some(source),
             Self::InvalidAccountJson(source) => Some(source),
+            Self::InvalidTenantJson(source) => Some(source),
+            Self::InvalidTenantMetadataJson(source) => Some(source),
             Self::NotFound { .. } | Self::CommandFailed { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AzureCli;
+    use crate::model::TenantDescription;
+
+    fn tenant(tenant_id: &str, display_name: &str, default_domain: &str) -> TenantDescription {
+        TenantDescription {
+            tenant_id: tenant_id.to_owned(),
+            display_name: display_name.to_owned(),
+            default_domain: default_domain.to_owned(),
+        }
+    }
+
+    #[test]
+    fn merges_names_from_later_duplicate_account_records() {
+        let mut descriptions = vec![tenant("tenant-a", "", "")];
+        let metadata = vec![
+            tenant("tenant-a", "", ""),
+            tenant("TENANT-A", "Contoso", "contoso.onmicrosoft.com"),
+        ];
+
+        AzureCli::merge_tenant_metadata(&mut descriptions, &metadata);
+
+        assert_eq!(descriptions[0].display_name, "Contoso");
+        assert_eq!(descriptions[0].default_domain, "contoso.onmicrosoft.com");
+    }
+
+    #[test]
+    fn preserves_existing_names_and_does_not_cross_tenants() {
+        let mut descriptions = vec![
+            tenant("tenant-a", "Existing", "existing.example"),
+            tenant("tenant-b", "", ""),
+        ];
+        let metadata = vec![
+            tenant("tenant-a", "Wrong", "wrong.example"),
+            tenant("tenant-b", "Fabrikam", "fabrikam.onmicrosoft.com"),
+        ];
+
+        AzureCli::merge_tenant_metadata(&mut descriptions, &metadata);
+
+        assert_eq!(descriptions[0].display_name, "Existing");
+        assert_eq!(descriptions[0].default_domain, "existing.example");
+        assert_eq!(descriptions[1].display_name, "Fabrikam");
+    }
+    #[test]
+    fn appends_tenants_missing_from_resource_manager_response() {
+        let mut descriptions = vec![tenant("tenant-a", "Contoso", "contoso.example")];
+        let metadata = vec![tenant("tenant-b", "Fabrikam", "fabrikam.example")];
+
+        AzureCli::merge_tenant_metadata(&mut descriptions, &metadata);
+
+        assert_eq!(descriptions.len(), 2);
+        assert_eq!(descriptions[1], metadata[0]);
     }
 }

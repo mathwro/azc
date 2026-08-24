@@ -1,21 +1,25 @@
 # azc
 
-`azc` is a fast terminal subscription switcher for the Azure CLI. Open a searchable picker with `azc`, or switch directly with a short query such as `azc hr`.
+`azc` is a fast terminal subscription and tenant switcher for the Azure CLI. Open a searchable subscription picker with `azc`, or switch directly with a short query such as `azc hr`.
 
 ```text
-azc                  # open the interactive picker
+azc                  # open the interactive subscription picker
 azc hr               # switch to the unique best match for "hr"
 azc human resources  # queries may contain multiple unquoted words
+azc tenant           # open the interactive tenant picker
+azc tenant 0000      # switch to the unique best tenant-ID match
 azc --refresh        # refresh subscriptions from Azure, then open the picker
 azc --refresh hr     # refresh, then switch by query
-azc --version        # print version and reproducible build metadata
 azc update           # update to the latest GitHub version
+azc --version        # print version and reproducible build metadata
 ```
 
 ## Why azc
 
-Changing subscriptions with the Azure CLI normally means listing accounts, finding a name or ID, and passing it to `az account set`. `azc` keeps that workflow fast:
-
+- The TUI shows the active tenant in its title and footer.
+- `Ctrl+T` toggles between the subscription list and a tenant list.
+- The tenant picker groups enabled subscriptions by tenant and marks the active tenant.
+- Selecting a tenant switches to one of its subscriptions, which is how Azure CLI changes active tenant context.
 - The TUI is in search mode from its first frame—just start typing.
 - Azure CLI loading runs in the background, so it does not block keyboard input.
 - Direct mode ranks partial names predictably.
@@ -74,7 +78,7 @@ Print the installed version and embedded build provenance without network access
 
 ```sh
 azc --version
-# azc 0.1.0 (commit 82f80fca98b1, built 2026-08-13)
+# azc 0.2.0 (commit 82f80fca98b1, built 2026-08-13)
 ```
 
 Update to the latest version from the repository's default branch:
@@ -93,24 +97,25 @@ It therefore requires Cargo, network access to GitHub, and permission to write t
 
 ## Interactive picker
 
-Run `azc` without a query. Printable characters immediately filter subscription names, subscription IDs, and tenant IDs.
+Run `azc` without a query. Printable characters immediately filter subscription names, subscription IDs, and tenant IDs. The title and footer always show the current tenant ID.
 
 | Key | Action |
 | --- | --- |
-| Type or paste | Filter subscriptions |
+| Type or paste | Filter the active list |
 | `Up` / `Down`, `Alt+j` / `Alt+k` | Move the selection |
 | `Ctrl+P` / `Ctrl+N` | Move the selection |
+| `Ctrl+T` | Toggle between subscriptions and tenants |
 | `Home` / `End` | Jump to the first / last match |
-| `Enter` | Switch to the selected subscription |
+| `Enter` | Switch to the selected subscription or tenant |
 | `Backspace` | Remove the last query character |
 | `Ctrl+U` | Clear the query |
 | `Esc` / `Ctrl+C` | Cancel without changing context |
 
-The current subscription is marked with a green dot and appears first when the search is empty. Selecting an item exits the TUI, restores the terminal, runs the context change, and prints the selected name and ID.
+The subscription list marks the current subscription with a green dot. Tenant mode groups enabled subscriptions by tenant, displays each tenant's Azure directory name and ID, marks the current tenant, and shows its subscription count. Selecting a tenant switches to one of its subscriptions, exits the TUI, restores the terminal, and prints the tenant ID plus switch target.
 
 ## Direct matching
 
-`azc <query>` ranks case-insensitive matches in this order:
+`azc <query>` ranks case-insensitive subscription matches in this order:
 
 1. Exact subscription name or ID
 2. Name prefix
@@ -118,25 +123,27 @@ The current subscription is marked with a green dot and appears first when the s
 4. Name substring
 5. Subscription ID or tenant ID substring
 
-A uniquely best-ranked result is switched immediately:
+`azc tenant <query>` applies exact, prefix, and substring matching to tenant display names, default domains, and IDs. A uniquely best-ranked tenant is switched by selecting one of its subscriptions:
 
 ```text
-$ azc hr
-Switched to HR Production (00000000-0000-0000-0000-000000000002)
+$ azc tenant 1000
+Switched to tenant 10000000-0000-0000-0000-000000000001 via HR Production (00000000-0000-0000-0000-000000000002)
 ```
 
-If multiple subscriptions tie at the best rank, `azc` exits without changing context and lists the ambiguous names. Use a longer query or open the picker. `update` and `version` are command names; search for subscriptions with those exact names using `azc -- update` or `azc -- version`.
+If multiple subscriptions or tenants tie at the best rank, `azc` exits without changing context and lists the ambiguous values. Use a longer query, or open the appropriate picker. `update`, `version`, and `tenant` are command names; search for subscriptions with those exact names using `azc -- update`, `azc -- version`, or `azc -- tenant`.
 
 ## Azure CLI behavior
 
 `azc` delegates all account state to Azure CLI:
 
 ```text
-az account list --output json --only-show-errors
+az account list --output json --only-show-errors [--refresh]
+az rest --method get --url "https://management.azure.com/tenants?api-version=2022-12-01" --query "value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain}" --output json
+az account list --all --query "[].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain}" --output json
 az account set --subscription <id> --only-show-errors
 ```
 
-The ordinary list command uses Azure CLI's local subscription data and returns enabled subscriptions from the current cloud. `--refresh` adds Azure CLI's `--refresh` option to retrieve current subscriptions from Azure.
+The ordinary subscription list uses Azure CLI's local account data. `--refresh` adds Azure CLI's `--refresh` option to retrieve current subscriptions from Azure. The tenant picker gets tenant IDs, display names, and default domains from the Azure Resource Manager tenants endpoint through `az rest`, then fills missing metadata from the filtered local `az account list --all` query. If tenant metadata is unavailable, it falls back to tenant IDs. Switching a tenant means selecting one of its subscriptions by ID; Azure CLI then makes that subscription and its tenant active.
 
 See Microsoft's [`az account` reference](https://learn.microsoft.com/cli/azure/account?view=azure-cli-latest) for the underlying command behavior.
 
@@ -185,7 +192,7 @@ azc --refresh
 
 ### A direct query is ambiguous
 
-Add enough of the subscription name to produce one best-ranked match, or run `azc` and choose interactively.
+For subscriptions, add enough of the name to produce one best-ranked match, or run `azc` and choose interactively. For tenants, add more of the tenant ID or run `azc tenant`.
 
 ## Project layout
 
@@ -195,7 +202,7 @@ src/
 ├── cli.rs       Argument parsing and help output
 ├── main.rs      Mode dispatch and exit behavior
 ├── matcher.rs   Shared ranking and unique-match selection
-├── model.rs     Azure subscription JSON model
+├── model.rs     Azure subscription and tenant models
 ├── tui.rs       Background loading, input handling, and rendering
 ├── updater.rs   Cargo-based updates and update error reporting
 └── version.rs   Embedded release version and build provenance
@@ -233,8 +240,8 @@ Publish a stable release:
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.1.0 -m "azc v0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "azc v0.2.0"
+git push origin v0.2.0
 ```
 
 The stable tag run repeats the dry-run checks with locked dependencies and waits at the protected `release` environment before creating and publishing the immutable GitHub Release. Stable publication then calls the central notifier, which verifies the exact release and sends the canonical package update event.

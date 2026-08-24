@@ -15,15 +15,35 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::{azure::AzureCli, matcher::ranked_indices, model::Subscription};
+use crate::{
+    azure::AzureCli,
+    matcher::{ranked_indices, ranked_tenant_indices},
+    model::{Subscription, Tenant, TenantDescription, tenants_from_subscriptions},
+};
 
+type LoadedAccounts = Result<(Vec<Subscription>, Vec<TenantDescription>), String>;
 pub fn choose_subscription(
     azure: AzureCli,
     refresh: bool,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
+    choose(azure, refresh, false)
+}
+
+pub fn choose_tenant(
+    azure: AzureCli,
+    refresh: bool,
+) -> Result<Option<Subscription>, Box<dyn Error>> {
+    choose(azure, refresh, true)
+}
+
+fn choose(
+    azure: AzureCli,
+    refresh: bool,
+    tenant_mode: bool,
+) -> Result<Option<Subscription>, Box<dyn Error>> {
     let receiver = load_in_background(azure, refresh);
     let mut terminal = ratatui::try_init()?;
-    let result = run(&mut terminal, receiver);
+    let result = run(&mut terminal, receiver, tenant_mode);
     let restore_result = ratatui::try_restore();
 
     match (result, restore_result) {
@@ -33,14 +53,15 @@ pub fn choose_subscription(
     }
 }
 
-fn load_in_background(
-    azure: AzureCli,
-    refresh: bool,
-) -> Receiver<Result<Vec<Subscription>, String>> {
+fn load_in_background(azure: AzureCli, refresh: bool) -> Receiver<LoadedAccounts> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let result = azure
             .list_subscriptions(refresh)
+            .map(|subscriptions| {
+                let descriptions = azure.list_tenants().unwrap_or_default();
+                (subscriptions, descriptions)
+            })
             .map_err(|error| error.to_string());
         let _ = sender.send(result);
     });
@@ -49,9 +70,10 @@ fn load_in_background(
 
 fn run(
     terminal: &mut DefaultTerminal,
-    receiver: Receiver<Result<Vec<Subscription>, String>>,
+    receiver: Receiver<LoadedAccounts>,
+    tenant_mode: bool,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
-    let mut app = App::new();
+    let mut app = App::new(tenant_mode);
 
     loop {
         app.receive_accounts(&receiver);
@@ -77,33 +99,38 @@ fn run(
 #[derive(Debug)]
 struct App {
     subscriptions: Vec<Subscription>,
+    tenants: Vec<Tenant>,
     filtered: Vec<usize>,
     query: String,
     list_state: ListState,
     loading: bool,
     load_error: Option<String>,
+    tenant_mode: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(tenant_mode: bool) -> Self {
         Self {
             subscriptions: Vec::new(),
+            tenants: Vec::new(),
             filtered: Vec::new(),
             query: String::new(),
             list_state: ListState::default(),
             loading: true,
             load_error: None,
+            tenant_mode,
         }
     }
 
-    fn receive_accounts(&mut self, receiver: &Receiver<Result<Vec<Subscription>, String>>) {
+    fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) {
         if !self.loading {
             return;
         }
 
         match receiver.try_recv() {
-            Ok(Ok(subscriptions)) => {
+            Ok(Ok((subscriptions, descriptions))) => {
                 self.loading = false;
+                self.tenants = tenants_from_subscriptions(&subscriptions, &descriptions);
                 self.subscriptions = subscriptions;
                 self.refresh_filter();
             }
@@ -138,6 +165,12 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Some(Action::Cancel),
+                KeyCode::Char('t') => {
+                    self.tenant_mode = !self.tenant_mode;
+                    self.query.clear();
+                    self.refresh_filter();
+                    None
+                }
                 KeyCode::Char('u') => {
                     self.query.clear();
                     self.refresh_filter();
@@ -195,16 +228,28 @@ impl App {
     }
 
     fn refresh_filter(&mut self) {
-        self.filtered = ranked_indices(&self.query, &self.subscriptions);
+        self.filtered = if self.tenant_mode {
+            ranked_tenant_indices(&self.query, &self.tenants)
+        } else {
+            ranked_indices(&self.query, &self.subscriptions)
+        };
         self.list_state
             .select((!self.filtered.is_empty()).then_some(0));
     }
 
     fn selected(&self) -> Option<&Subscription> {
-        self.list_state
+        let subscription_index = self
+            .list_state
             .selected()
             .and_then(|selected| self.filtered.get(selected))
-            .and_then(|&index| self.subscriptions.get(index))
+            .map(|&index| {
+                if self.tenant_mode {
+                    self.tenants[index].subscription_index
+                } else {
+                    index
+                }
+            })?;
+        self.subscriptions.get(subscription_index)
     }
 
     fn next(&mut self) {
@@ -269,11 +314,16 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         .chars()
         .map(|character| character.width().unwrap_or(0))
         .sum::<usize>();
+    let title = if app.tenant_mode {
+        " Search tenants "
+    } else {
+        " Search subscriptions "
+    };
     let search = Paragraph::new(visible_query.as_str()).block(
         Block::new()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(Color::Cyan))
-            .title(" Search subscriptions "),
+            .title(title),
     );
     frame.render_widget(search, area);
 
@@ -286,47 +336,117 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let items = app
-        .filtered
+    let items = if app.tenant_mode {
+        app.filtered
+            .iter()
+            .filter_map(|&index| app.tenants.get(index))
+            .map(|tenant| {
+                let marker = if tenant.is_current { "● " } else { "  " };
+                let marker_style = if tenant.is_current {
+                    Style::new().fg(Color::Green)
+                } else {
+                    Style::new()
+                };
+                let id_style = if tenant.is_current {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+
+                let tenant_name = if tenant.name.is_empty() {
+                    tenant.id.as_str()
+                } else {
+                    tenant.name.as_str()
+                };
+                let tenant_details = if tenant_name.eq_ignore_ascii_case(&tenant.id) {
+                    format!("  {} subscription(s)", tenant.subscription_count)
+                } else {
+                    format!(
+                        "  {} · {} subscription(s)",
+                        tenant.id, tenant.subscription_count
+                    )
+                };
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(tenant_name.to_owned(), id_style),
+                    Span::styled(tenant_details, Style::new().fg(Color::DarkGray)),
+                ]))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        app.filtered
+            .iter()
+            .filter_map(|&index| app.subscriptions.get(index))
+            .map(|subscription| {
+                let marker = if subscription.is_default {
+                    "● "
+                } else {
+                    "  "
+                };
+                let marker_style = if subscription.is_default {
+                    Style::new().fg(Color::Green)
+                } else {
+                    Style::new()
+                };
+                let name_style = if subscription.is_default {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(subscription.name.clone(), name_style),
+                    Span::styled(
+                        format!("  {}", subscription.id),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let current_tenant = app
+        .tenants
         .iter()
-        .filter_map(|&index| app.subscriptions.get(index))
-        .map(|subscription| {
-            let marker = if subscription.is_default {
-                "● "
-            } else {
-                "  "
-            };
-            let marker_style = if subscription.is_default {
-                Style::new().fg(Color::Green)
-            } else {
-                Style::new()
-            };
-            let name_style = if subscription.is_default {
-                Style::new().add_modifier(Modifier::BOLD)
-            } else {
-                Style::new()
-            };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(marker, marker_style),
-                Span::styled(subscription.name.clone(), name_style),
-                Span::styled(
-                    format!("  {}", subscription.id),
-                    Style::new().fg(Color::DarkGray),
-                ),
-            ]))
-        })
-        .collect::<Vec<_>>();
-
+        .find(|tenant| tenant.is_current)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |tenant| {
+                if tenant.name.is_empty() {
+                    tenant.id.clone()
+                } else {
+                    format!("{} ({})", tenant.name, tenant.id)
+                }
+            },
+        );
     let title = if app.loading {
-        " Subscriptions · loading Azure CLI… ".to_owned()
+        format!(
+            " {} · loading Azure CLI… ",
+            if app.tenant_mode {
+                "Tenants"
+            } else {
+                "Subscriptions"
+            }
+        )
     } else if let Some(error) = &app.load_error {
         format!(" Azure CLI error · {error} ")
     } else {
         format!(
-            " Subscriptions · {} of {} ",
+            " {} · {} of {} · current tenant {} ",
+            if app.tenant_mode {
+                "Tenants"
+            } else {
+                "Subscriptions"
+            },
             app.filtered.len(),
-            app.subscriptions.len()
+            if app.tenant_mode {
+                app.tenants.len()
+            } else {
+                app.subscriptions.len()
+            },
+            current_tenant
         )
     };
 
@@ -347,7 +467,9 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 
     if !app.loading && app.load_error.is_none() && app.filtered.is_empty() {
-        let message = if app.subscriptions.is_empty() {
+        let message = if app.tenant_mode {
+            "No tenants with enabled subscriptions found"
+        } else if app.subscriptions.is_empty() {
             "No enabled subscriptions found"
         } else {
             "No matching subscriptions"
@@ -362,13 +484,40 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let status = if let Some(selected) = app.selected() {
+    let current_tenant = app
+        .tenants
+        .iter()
+        .find(|tenant| tenant.is_current)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |tenant| {
+                if tenant.name.is_empty() {
+                    tenant.id.clone()
+                } else {
+                    format!("{} ({})", tenant.name, tenant.id)
+                }
+            },
+        );
+    let status = if app.selected().is_some() {
         format!(
-            " Enter switch · ↑/↓ or Alt+j/k navigate · Esc cancel    tenant {} ",
-            selected.tenant_id
+            " Enter switch · Ctrl+T {} · Esc cancel · current tenant {} ",
+            if app.tenant_mode {
+                "subscriptions"
+            } else {
+                "tenants"
+            },
+            current_tenant
         )
     } else {
-        " Type to search · ↑/↓ or Alt+j/k navigate · Esc cancel ".to_owned()
+        format!(
+            " Type to search · Ctrl+T {} · Esc cancel · current tenant {} ",
+            if app.tenant_mode {
+                "subscriptions"
+            } else {
+                "tenants"
+            },
+            current_tenant
+        )
     };
     frame.render_widget(
         Paragraph::new(status).style(Style::new().fg(Color::DarkGray)),
@@ -394,8 +543,13 @@ fn trailing_width(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, App, trailing_width};
-    use crate::model::Subscription;
+    use super::{Action, App, render, trailing_width};
+    use crate::{
+        azure::AzureCli,
+        model::{Subscription, TenantDescription, tenants_from_subscriptions},
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn subscriptions() -> Vec<Subscription> {
@@ -413,9 +567,10 @@ mod tests {
     }
 
     fn loaded_app() -> App {
-        let mut app = App::new();
+        let mut app = App::new(false);
         app.loading = false;
         app.subscriptions = subscriptions();
+        app.tenants = tenants_from_subscriptions(&app.subscriptions, &[]);
         app.refresh_filter();
         app
     }
@@ -472,6 +627,70 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.query, "j");
+    }
+
+    #[test]
+    fn ctrl_t_switches_to_tenants_and_selects_their_current_subscription() {
+        let mut app = loaded_app();
+        app.subscriptions[1].tenant_id = "other-tenant".to_owned();
+        app.subscriptions[1].is_default = false;
+        app.subscriptions[2].tenant_id = "other-tenant".to_owned();
+        app.tenants = tenants_from_subscriptions(&app.subscriptions, &[]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+
+        assert!(app.tenant_mode);
+        assert_eq!(app.filtered.len(), 2);
+        assert_eq!(app.selected().unwrap().tenant_id, "tenant");
+        app.next();
+        assert_eq!(app.selected().unwrap().tenant_id, "other-tenant");
+    }
+
+    #[test]
+    fn renders_display_names_for_every_tenant_from_json() {
+        let subscriptions = vec![
+            Subscription {
+                id: "subscription-a".to_owned(),
+                name: "Alpha".to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                is_default: true,
+                state: "Enabled".to_owned(),
+            },
+            Subscription {
+                id: "subscription-b".to_owned(),
+                name: "Beta".to_owned(),
+                tenant_id: "tenant-b".to_owned(),
+                is_default: false,
+                state: "Enabled".to_owned(),
+            },
+        ];
+        let mut descriptions: Vec<TenantDescription> =
+            serde_json::from_str(r#"[{"tenantId":"tenant-a","displayName":"Tenant A"}]"#).unwrap();
+        let metadata: Vec<TenantDescription> =
+            serde_json::from_str(r#"[{"tenantId":"tenant-b","displayName":"Tenant B"}]"#).unwrap();
+        AzureCli::merge_tenant_metadata(&mut descriptions, &metadata);
+        let mut app = App::new(true);
+        app.loading = false;
+        app.subscriptions = subscriptions;
+        app.tenants = tenants_from_subscriptions(&app.subscriptions, &descriptions);
+        app.refresh_filter();
+
+        let backend = TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let frame = terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = frame
+            .buffer
+            .content()
+            .iter()
+            .fold(String::new(), |mut text, cell| {
+                text.push_str(cell.symbol());
+                text
+            });
+
+        assert!(rendered.contains("Tenant A"));
+        assert!(rendered.contains("Tenant B"));
+        assert!(rendered.contains("tenant-a"));
+        assert!(rendered.contains("tenant-b"));
     }
 
     #[test]

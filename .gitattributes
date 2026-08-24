@@ -1,0 +1,2 @@
+# Keep tracked text files normalized and checked out with LF endings.
+* text=auto eol=lf

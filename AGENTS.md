@@ -20,7 +20,7 @@
 - `src/main.rs` — mode dispatch, user-facing success/error output, and exit status.
 - `src/cli.rs` — dependency-free argument parsing and canonical `--help` text.
 - `src/azure.rs` — Azure CLI discovery, process execution, JSON decoding, and command errors.
-- `src/model.rs` — deserialized `az account list` subscription shape.
+- `src/model.rs` — deserialized subscription and tenant metadata shapes.
 - `src/matcher.rs` — shared ranking plus safe unique-match selection.
 - `src/tui.rs` — background loading, terminal lifecycle, event handling, filtering, and rendering.
 - `src/updater.rs` — Cargo-based Git update command, platform handoff, and update errors.
@@ -34,10 +34,12 @@ The supported command contract is:
 
 ```text
 az account list --output json --only-show-errors [--refresh]
+az rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json
+az account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json
 az account set --subscription <id> --only-show-errors
 ```
 
-`az account list` is intentionally used without `--all`, so disabled subscriptions are excluded. `Subscription` tolerates omitted optional Azure fields, but `id` and `name` remain required. Preserve Azure CLI stderr in actionable errors without printing credentials or environment contents.
+`az account list` is intentionally used without `--all` for subscription choices, so disabled subscriptions are excluded. The `--all` metadata query must not become a subscription source or cache. `Subscription` tolerates omitted optional Azure fields, but `id` and `name` remain required. Preserve Azure CLI stderr in actionable errors without printing credentials or environment contents.
 
 `AZC_AZ_BIN` overrides executable discovery. On Windows, default discovery must continue to support `az.exe`, `az.cmd`, and `az.bat` on `PATH`.
 
@@ -65,6 +67,10 @@ Execute Cargo directly without a shell. Unix waits for Cargo and propagates fail
 ## Verification
 
 Tests live beside their implementation. Add tests for observable changes to parsing, update invocation, ranking, ambiguity, input handling, navigation, or Azure JSON decoding.
+- Verification is a release gate, not advisory: never present a code update as ready while any required test, formatter, linter, target check, or smoke check fails.
+- A reported failure is authoritative. Reproduce it when tooling is available, fix the cause, and rerun the failing check plus the complete required gate before delivery.
+- If required tooling is unavailable, explicitly mark the update unverified and do not describe it as ready or complete.
+- Tests for multi-tenant behavior must exercise the full JSON-to-rendered-label path, including display names for more than one tenant and duplicate or partial Azure metadata records.
 
 Run before completion:
 
