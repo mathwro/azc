@@ -1,4 +1,5 @@
 mod azure;
+mod cache;
 mod cli;
 mod matcher;
 mod model;

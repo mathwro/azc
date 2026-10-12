@@ -116,7 +116,7 @@ COMMANDS:
     azc version         Print the installed version
 
 OPTIONS:
-    -r, --refresh       Refresh subscriptions from Azure before listing
+    -r, --refresh       Refresh from Azure; bypass cached picker results
     -h, --help          Print help
     -V, --version       Print version
     --                  Treat remaining arguments as a query, including command names
@@ -127,13 +127,21 @@ INTERACTIVE KEYS:
     Alt+j/k             Move selection (Vim)
     Ctrl+P/N            Move selection (Emacs)
     Ctrl+T              Switch between subscriptions and tenants
+    Ctrl+R              Refresh subscriptions from Azure in the background
     Home/End            Jump to first/last match
     Enter               Switch to selected subscription or tenant
     Esc, Ctrl+C         Cancel
     Ctrl+U              Clear search
 
+INTERACTIVE LOADING:
+    Show the last picker snapshot (up to seven days old), then update in
+    the background. Subscriptions appear before tenant names finish loading.
+    Direct queries never use the picker cache.
+
 ENVIRONMENT:
     AZC_AZ_BIN           Azure CLI executable override (default: az)
+    AZURE_CONFIG_DIR     Azure configuration and picker cache directory
+                         (default: ~/.azure)
 "
 }
 

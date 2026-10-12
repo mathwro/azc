@@ -22,6 +22,7 @@ azc --version        # print version and reproducible build metadata
 - Selecting a tenant switches to one of its subscriptions, which is how Azure CLI changes active tenant context.
 - The TUI is in search mode from its first frame—just start typing.
 - Azure CLI loading runs in the background, so it does not block keyboard input.
+- Recent picker results appear immediately while Azure CLI updates them in the background.
 - Direct mode ranks partial names predictably.
 - Ambiguous direct matches fail instead of selecting the wrong subscription.
 - Azure authentication stays in the installed Azure CLI; `azc` does not handle credentials or tokens.
@@ -78,7 +79,6 @@ Print the installed version and embedded build provenance without network access
 
 ```sh
 azc --version
-# azc 0.2.0 (commit 82f80fca98b1, built 2026-08-13)
 ```
 
 Update to the latest version from the repository's default branch:
@@ -97,7 +97,7 @@ It therefore requires Cargo, network access to GitHub, and permission to write t
 
 ## Interactive picker
 
-Run `azc` without a query. Printable characters immediately filter subscription names, subscription IDs, and tenant IDs. The title and footer always show the current tenant ID.
+Run `azc` without a query. Printable characters immediately filter subscription names, subscription IDs, and tenant IDs. The footer shows the current tenant ID once account data is available; cached markers reflect the last snapshot until the background listing finishes.
 
 | Key | Action |
 | --- | --- |
@@ -105,6 +105,7 @@ Run `azc` without a query. Printable characters immediately filter subscription 
 | `Up` / `Down`, `Alt+j` / `Alt+k` | Move the selection |
 | `Ctrl+P` / `Ctrl+N` | Move the selection |
 | `Ctrl+T` | Toggle between subscriptions and tenants |
+| `Ctrl+R` | Refresh subscriptions from Azure without leaving the picker |
 | `Home` / `End` | Jump to the first / last match |
 | `Enter` | Switch to the selected subscription or tenant |
 | `Backspace` | Remove the last query character |
@@ -112,6 +113,16 @@ Run `azc` without a query. Printable characters immediately filter subscription 
 | `Esc` / `Ctrl+C` | Cancel without changing context |
 
 The subscription list marks the current subscription with a green dot. Tenant mode groups enabled subscriptions by tenant, displays each tenant's Azure directory name and ID, marks the current tenant, and shows its subscription count. Selecting a tenant switches to one of its subscriptions, exits the TUI, restores the terminal, and prints the tenant ID plus switch target.
+
+The subscription and tenant pickers first show the last successful subscription list if it is no more than seven days old, marked **cached · updating…**. Azure CLI then reloads subscriptions in the background, followed by tenant names. On a first run, subscriptions become searchable without waiting for tenant metadata.
+
+Updates preserve your search text and highlighted subscription ID. If the selected subscription disappears or no longer matches, the selection clears: navigate or edit the search before pressing Enter. You can select a cached subscription before updating finishes; Azure CLI handles the switch by ID and any failure is reported without choosing a replacement. If background listing fails, cached results remain available with an error indicator.
+
+Press `Ctrl+R` in either picker to request a server refresh, just like `--refresh`. The current list stays usable while subscriptions and tenant names reload, and the successful results update the cache. If startup loading is still running, one refresh is queued behind it and superseded startup results are ignored. Further `Ctrl+R` presses are ignored until that refresh finishes. A failed refresh keeps the existing list and shows the error; press `Ctrl+R` again to retry. Refreshing itself never changes Azure context.
+
+The snapshot contains subscription IDs, names, tenant IDs, last-seen active markers, and tenant labels—not credentials or tokens. It is stored as `azc-picker-cache.json` inside `AZURE_CONFIG_DIR`, or `~/.azure` by default, and is scoped to the Azure CLI executable override. Missing, expired, incompatible, or corrupt snapshots are ignored; an unwritable cache does not prevent normal loading. Delete that file to reset the picker cache.
+
+`azc --refresh` and `azc tenant --refresh` bypass cached results and explicitly refresh subscriptions from Azure. Direct queries (`azc <query>` and `azc tenant <query>`) always use Azure CLI output, never the picker snapshot. A recent snapshot can still be stale after signing in as another user or changing context elsewhere; use `--refresh` when you need to start from refreshed account data.
 
 ## Direct matching
 
@@ -199,6 +210,7 @@ For subscriptions, add enough of the name to produce one best-ranked match, or r
 ```text
 src/
 ├── azure.rs     Azure CLI process boundary and error reporting
+├── cache.rs     Best-effort interactive subscription and tenant snapshots
 ├── cli.rs       Argument parsing and help output
 ├── main.rs      Mode dispatch and exit behavior
 ├── matcher.rs   Shared ranking and unique-match selection
@@ -240,8 +252,8 @@ Publish a stable release:
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.2.0 -m "azc v0.2.0"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "azc v0.3.0"
+git push origin v0.3.0
 ```
 
 The stable tag run repeats the dry-run checks with locked dependencies and waits at the protected `release` environment before creating and publishing the immutable GitHub Release. Stable publication then calls the central notifier, which verifies the exact release and sends the canonical package update event.

@@ -11,7 +11,9 @@
 - Direct mode (`azc <query>`) switches only when the best match is unique. Equal-ranked matches return an ambiguity error rather than guessing.
 - Context changes use the selected subscription ID, not its display name.
 - Azure CLI is executed directly with `std::process::Command`; keep query and subscription data out of shell command strings.
-- Ordinary listing uses Azure CLI's local account data. `--refresh` is the explicit server-refresh path; do not add a second subscription cache.
+- Ordinary listing uses Azure CLI's local account data. `--refresh` bypasses picker snapshots; it and interactive `Ctrl+R` explicitly request a server refresh. Only interactive mode may show a recent last-run snapshot while reloading; direct queries always use Azure CLI output.
+- Background picker updates preserve query and switch target by subscription ID. Clear selection when that target disappears or no longer matches; cached rows may be selected, but Azure CLI remains authoritative for switching.
+- Keep picker loads on one background thread. `Ctrl+R` queues one refresh behind startup loading, ignores superseded startup results, and coalesces further presses until completion.
 - `azc update` reinstalls from the manifest repository with Cargo; `azc version` reports `CARGO_PKG_VERSION`. `azc -- update` and `azc -- version` preserve those words as direct queries.
 - Windows PowerShell, Linux, and macOS are first-class. Keep platform-specific process and terminal behavior isolated and compile-checkable.
 
@@ -20,6 +22,7 @@
 - `src/main.rs` — mode dispatch, user-facing success/error output, and exit status.
 - `src/cli.rs` — dependency-free argument parsing and canonical `--help` text.
 - `src/azure.rs` — Azure CLI discovery, process execution, JSON decoding, and command errors.
+- `src/cache.rs` — best-effort, versioned interactive snapshots scoped to Azure configuration and executable; never persist credentials or tokens.
 - `src/model.rs` — deserialized subscription and tenant metadata shapes.
 - `src/matcher.rs` — shared ranking plus safe unique-match selection.
 - `src/tui.rs` — background loading, terminal lifecycle, event handling, filtering, and rendering.

@@ -1,6 +1,9 @@
 use std::{
     error::Error,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
+    },
     thread,
     time::Duration,
 };
@@ -17,11 +20,23 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     azure::AzureCli,
+    cache::Cache,
     matcher::{ranked_indices, ranked_tenant_indices},
     model::{Subscription, Tenant, TenantDescription, tenants_from_subscriptions},
 };
 
-type LoadedAccounts = Result<(Vec<Subscription>, Vec<TenantDescription>), String>;
+enum LoadedAccounts {
+    RefreshStarted,
+    Cached(Vec<Subscription>, Vec<TenantDescription>),
+    Subscriptions(Arc<Vec<Subscription>>),
+    Tenants(Vec<TenantDescription>),
+    Failed(String),
+}
+
+struct AccountLoader {
+    accounts: Receiver<LoadedAccounts>,
+    refresh: SyncSender<()>,
+}
 pub fn choose_subscription(
     azure: AzureCli,
     refresh: bool,
@@ -41,9 +56,9 @@ fn choose(
     refresh: bool,
     tenant_mode: bool,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
-    let receiver = load_in_background(azure, refresh);
+    let loader = load_in_background(azure, refresh);
     let mut terminal = ratatui::try_init()?;
-    let result = run(&mut terminal, receiver, tenant_mode);
+    let result = run(&mut terminal, loader, tenant_mode, refresh);
     let restore_result = ratatui::try_restore();
 
     match (result, restore_result) {
@@ -53,40 +68,96 @@ fn choose(
     }
 }
 
-fn load_in_background(azure: AzureCli, refresh: bool) -> Receiver<LoadedAccounts> {
-    let (sender, receiver) = mpsc::sync_channel(1);
+fn load_in_background(azure: AzureCli, refresh: bool) -> AccountLoader {
+    let (sender, accounts) = mpsc::channel();
+    let (request, requests) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let result = azure
-            .list_subscriptions(refresh)
-            .map(|subscriptions| {
-                let descriptions = azure.list_tenants().unwrap_or_default();
-                (subscriptions, descriptions)
-            })
-            .map_err(|error| error.to_string());
-        let _ = sender.send(result);
+        if !load_accounts(&azure, refresh, &sender) {
+            return;
+        }
+        for () in requests {
+            if !load_accounts(&azure, true, &sender) {
+                break;
+            }
+        }
     });
-    receiver
+    AccountLoader {
+        accounts,
+        refresh: request,
+    }
+}
+
+fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts>) -> bool {
+    if refresh && sender.send(LoadedAccounts::RefreshStarted).is_err() {
+        return false;
+    }
+    let cache = Cache::from_env();
+    if !refresh
+        && let Some(snapshot) = cache.as_ref().and_then(Cache::load)
+        && sender
+            .send(LoadedAccounts::Cached(
+                snapshot.subscriptions,
+                snapshot.descriptions,
+            ))
+            .is_err()
+    {
+        return false;
+    }
+    let subscriptions: Arc<Vec<Subscription>> = match azure.list_subscriptions(refresh) {
+        Ok(subscriptions) => subscriptions.into(),
+        Err(error) => {
+            return sender
+                .send(LoadedAccounts::Failed(error.to_string()))
+                .is_ok();
+        }
+    };
+    // Save and publish subscriptions before waiting for tenant metadata.
+    if let Some(cache) = &cache {
+        let _ = cache.save(&subscriptions, &[]);
+    }
+    if sender
+        .send(LoadedAccounts::Subscriptions(Arc::clone(&subscriptions)))
+        .is_err()
+    {
+        return false;
+    }
+    let descriptions = azure.list_tenants().unwrap_or_default();
+    if let Some(cache) = &cache {
+        let _ = cache.save(&subscriptions, &descriptions);
+    }
+    sender.send(LoadedAccounts::Tenants(descriptions)).is_ok()
 }
 
 fn run(
     terminal: &mut DefaultTerminal,
-    receiver: Receiver<LoadedAccounts>,
+    loader: AccountLoader,
     tenant_mode: bool,
+    refresh: bool,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
     let mut app = App::new(tenant_mode);
+    app.refreshing = refresh;
 
     loop {
-        app.receive_accounts(&receiver);
+        app.receive_accounts(&loader.accounts);
         terminal.draw(|frame| render(frame, &mut app))?;
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if let Some(action) = app.handle_key(key) {
-                        return Ok(match action {
-                            Action::Cancel => None,
-                            Action::Select => app.selected().cloned(),
-                        });
+                        match action {
+                            Action::Cancel => return Ok(None),
+                            Action::Select => return Ok(app.selected().cloned()),
+                            Action::Refresh => {
+                                if loader.refresh.try_send(()).is_err() {
+                                    app.loading = false;
+                                    app.refreshing = false;
+                                    app.awaiting_refresh = false;
+                                    app.load_error =
+                                        Some("subscription loader stopped unexpectedly".to_owned());
+                                }
+                            }
+                        }
                     }
                 }
                 Event::Paste(text) => app.append_query(&text),
@@ -98,12 +169,17 @@ fn run(
 
 #[derive(Debug)]
 struct App {
-    subscriptions: Vec<Subscription>,
+    subscriptions: Arc<Vec<Subscription>>,
+    descriptions: Vec<TenantDescription>,
+    has_accounts: bool,
+    cached: bool,
     tenants: Vec<Tenant>,
     filtered: Vec<usize>,
     query: String,
     list_state: ListState,
     loading: bool,
+    refreshing: bool,
+    awaiting_refresh: bool,
     load_error: Option<String>,
     tenant_mode: bool,
 }
@@ -111,12 +187,17 @@ struct App {
 impl App {
     fn new(tenant_mode: bool) -> Self {
         Self {
-            subscriptions: Vec::new(),
+            subscriptions: Arc::new(Vec::new()),
+            descriptions: Vec::new(),
+            has_accounts: false,
+            cached: false,
             tenants: Vec::new(),
             filtered: Vec::new(),
             query: String::new(),
             list_state: ListState::default(),
             loading: true,
+            refreshing: false,
+            awaiting_refresh: false,
             load_error: None,
             tenant_mode,
         }
@@ -127,24 +208,80 @@ impl App {
             return;
         }
 
-        match receiver.try_recv() {
-            Ok(Ok((subscriptions, descriptions))) => {
-                self.loading = false;
-                self.tenants = tenants_from_subscriptions(&subscriptions, &descriptions);
-                self.subscriptions = subscriptions;
-                self.refresh_filter();
+        loop {
+            match receiver.try_recv() {
+                Ok(LoadedAccounts::RefreshStarted) => {
+                    self.awaiting_refresh = false;
+                    self.refreshing = true;
+                }
+                // The initial load may finish after Ctrl+R queues a server refresh.
+                Ok(_) if self.awaiting_refresh => {}
+                Ok(LoadedAccounts::Cached(subscriptions, descriptions)) => {
+                    self.descriptions = descriptions;
+                    self.replace_subscriptions(subscriptions.into());
+                    self.cached = true;
+                }
+                Ok(LoadedAccounts::Subscriptions(subscriptions)) => {
+                    self.replace_subscriptions(subscriptions);
+                    self.cached = false;
+                }
+                Ok(LoadedAccounts::Tenants(descriptions)) => {
+                    self.descriptions = descriptions;
+                    self.replace_subscriptions(Arc::clone(&self.subscriptions));
+                    self.loading = false;
+                    self.refreshing = false;
+                    break;
+                }
+                Ok(LoadedAccounts::Failed(error)) => {
+                    self.loading = false;
+                    self.refreshing = false;
+                    self.load_error = Some(error);
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.loading = false;
+                    self.refreshing = false;
+                    self.awaiting_refresh = false;
+                    self.load_error = Some("subscription loader stopped unexpectedly".to_owned());
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
             }
-            Ok(Err(error)) => {
-                self.loading = false;
-                self.load_error = Some(error);
-                self.refresh_filter();
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.loading = false;
-                self.load_error = Some("subscription loader stopped unexpectedly".to_owned());
-            }
-            Err(TryRecvError::Empty) => {}
         }
+    }
+
+    fn replace_subscriptions(&mut self, subscriptions: Arc<Vec<Subscription>>) {
+        let selected_index = self.selected_index();
+        let previous = std::mem::replace(&mut self.subscriptions, subscriptions);
+        let selected_id = selected_index
+            .and_then(|index| previous.get(index))
+            .map(|subscription| subscription.id.as_str());
+        self.tenants = tenants_from_subscriptions(&self.subscriptions, &self.descriptions);
+        self.refresh_filter();
+        if self.has_accounts {
+            let selected = selected_id.and_then(|id| {
+                let subscription_index = self
+                    .subscriptions
+                    .iter()
+                    .position(|subscription| subscription.id == id)?;
+                if self.tenant_mode {
+                    let tenant_index = self.tenants.iter().position(|tenant| {
+                        tenant.id == self.subscriptions[subscription_index].tenant_id
+                    })?;
+                    // Keep the actual switch target stable even if the active subscription changed.
+                    self.tenants[tenant_index].subscription_index = subscription_index;
+                    self.filtered
+                        .iter()
+                        .position(|&index| index == tenant_index)
+                } else {
+                    self.filtered
+                        .iter()
+                        .position(|&index| index == subscription_index)
+                }
+            });
+            self.list_state.select(selected);
+        }
+        self.has_accounts = true;
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -165,6 +302,13 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Some(Action::Cancel),
+                KeyCode::Char('r') if !self.refreshing => {
+                    self.loading = true;
+                    self.refreshing = true;
+                    self.awaiting_refresh = true;
+                    self.load_error = None;
+                    Some(Action::Refresh)
+                }
                 KeyCode::Char('t') => {
                     self.tenant_mode = !self.tenant_mode;
                     self.query.clear();
@@ -238,8 +382,11 @@ impl App {
     }
 
     fn selected(&self) -> Option<&Subscription> {
-        let subscription_index = self
-            .list_state
+        self.subscriptions.get(self.selected_index()?)
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.list_state
             .selected()
             .and_then(|selected| self.filtered.get(selected))
             .map(|&index| {
@@ -248,8 +395,7 @@ impl App {
                 } else {
                     index
                 }
-            })?;
-        self.subscriptions.get(subscription_index)
+            })
     }
 
     fn next(&mut self) {
@@ -292,6 +438,7 @@ impl App {
 enum Action {
     Cancel,
     Select,
+    Refresh,
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
@@ -423,15 +570,29 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     let title = if app.loading {
         format!(
-            " {} · loading Azure CLI… ",
+            " {} · {} ",
             if app.tenant_mode {
                 "Tenants"
             } else {
                 "Subscriptions"
+            },
+            if app.refreshing && app.cached {
+                "cached · refreshing Azure…"
+            } else if app.refreshing {
+                "refreshing Azure…"
+            } else if app.cached {
+                "cached · updating…"
+            } else if app.has_accounts {
+                "loading tenant names…"
+            } else {
+                "loading Azure CLI…"
             }
         )
     } else if let Some(error) = &app.load_error {
-        format!(" Azure CLI error · {error} ")
+        format!(
+            " {}Azure CLI error · {error} ",
+            if app.cached { "cached · " } else { "" }
+        )
     } else {
         format!(
             " {} · {} of {} · current tenant {} ",
@@ -500,7 +661,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
     let status = if app.selected().is_some() {
         format!(
-            " Enter switch · Ctrl+T {} · Esc cancel · current tenant {} ",
+            " Enter switch · Ctrl+R refresh · Ctrl+T {} · Esc cancel · current tenant {} ",
             if app.tenant_mode {
                 "subscriptions"
             } else {
@@ -510,7 +671,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else {
         format!(
-            " Type to search · Ctrl+T {} · Esc cancel · current tenant {} ",
+            " Type to search · Ctrl+R refresh · Ctrl+T {} · Esc cancel · current tenant {} ",
             if app.tenant_mode {
                 "subscriptions"
             } else {
@@ -543,7 +704,7 @@ fn trailing_width(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, App, render, trailing_width};
+    use super::{Action, App, LoadedAccounts, render, trailing_width};
     use crate::{
         azure::AzureCli,
         model::{Subscription, TenantDescription, tenants_from_subscriptions},
@@ -569,9 +730,7 @@ mod tests {
     fn loaded_app() -> App {
         let mut app = App::new(false);
         app.loading = false;
-        app.subscriptions = subscriptions();
-        app.tenants = tenants_from_subscriptions(&app.subscriptions, &[]);
-        app.refresh_filter();
+        app.replace_subscriptions(subscriptions().into());
         app
     }
 
@@ -599,6 +758,92 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(Action::Cancel)
         );
+    }
+
+    #[test]
+    fn ctrl_r_starts_loading_without_changing_search_or_switch_target() {
+        let mut app = loaded_app();
+        app.append_query("hr");
+        app.next();
+        app.load_error = Some("previous listing failed".to_owned());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert!(app.loading);
+        assert!(app.load_error.is_none());
+        assert_eq!(app.query, "hr");
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn requested_refresh_ignores_initial_loader_results() {
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(LoadedAccounts::Cached(subscriptions(), vec![]))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        app.append_query("hr");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        sender
+            .send(LoadedAccounts::Failed("obsolete load failed".to_owned()))
+            .unwrap();
+        sender
+            .send(LoadedAccounts::Subscriptions(vec![].into()))
+            .unwrap();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+
+        app.receive_accounts(&receiver);
+
+        assert!(app.loading);
+        assert!(app.load_error.is_none());
+        assert_eq!(app.query, "hr");
+        assert_eq!(app.selected().unwrap().id, "2");
+
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        app.receive_accounts(&receiver);
+        assert!(!app.loading);
+        assert!(app.load_error.is_none());
+        assert_eq!(app.query, "hr");
+        assert_eq!(app.selected().unwrap().id, "2");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(Action::Refresh)
+        );
+    }
+
+    #[test]
+    fn failed_refresh_retains_results_and_can_be_requested_again() {
+        let mut app = loaded_app();
+        app.append_query("hr");
+        app.next();
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        sender
+            .send(LoadedAccounts::Failed("refresh failed".to_owned()))
+            .unwrap();
+
+        app.receive_accounts(&receiver);
+
+        assert!(!app.loading);
+        assert!(app.load_error.is_some());
+        assert_eq!(app.query, "hr");
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(Action::Refresh)
+        );
+        assert!(app.loading);
+        assert!(app.load_error.is_none());
     }
 
     #[test]
@@ -632,9 +877,10 @@ mod tests {
     #[test]
     fn ctrl_t_switches_to_tenants_and_selects_their_current_subscription() {
         let mut app = loaded_app();
-        app.subscriptions[1].tenant_id = "other-tenant".to_owned();
-        app.subscriptions[1].is_default = false;
-        app.subscriptions[2].tenant_id = "other-tenant".to_owned();
+        let subscriptions = std::sync::Arc::make_mut(&mut app.subscriptions);
+        subscriptions[1].tenant_id = "other-tenant".to_owned();
+        subscriptions[1].is_default = false;
+        subscriptions[2].tenant_id = "other-tenant".to_owned();
         app.tenants = tenants_from_subscriptions(&app.subscriptions, &[]);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -648,32 +894,29 @@ mod tests {
 
     #[test]
     fn renders_display_names_for_every_tenant_from_json() {
-        let subscriptions = vec![
-            Subscription {
-                id: "subscription-a".to_owned(),
-                name: "Alpha".to_owned(),
-                tenant_id: "tenant-a".to_owned(),
-                is_default: true,
-                state: "Enabled".to_owned(),
-            },
-            Subscription {
-                id: "subscription-b".to_owned(),
-                name: "Beta".to_owned(),
-                tenant_id: "tenant-b".to_owned(),
-                is_default: false,
-                state: "Enabled".to_owned(),
-            },
-        ];
-        let mut descriptions: Vec<TenantDescription> =
-            serde_json::from_str(r#"[{"tenantId":"tenant-a","displayName":"Tenant A"}]"#).unwrap();
+        let subscriptions: Vec<Subscription> = serde_json::from_str(
+            r#"[{"id":"subscription-a","name":"Alpha","tenantId":"tenant-a","isDefault":true},
+                {"id":"subscription-b","name":"Beta","tenantId":"tenant-b"}]"#,
+        )
+        .unwrap();
+        let mut descriptions: Vec<TenantDescription> = serde_json::from_str(
+            r#"[{"tenantId":"tenant-a","displayName":"Tenant A"},{"tenantId":"tenant-b"}]"#,
+        )
+        .unwrap();
         let metadata: Vec<TenantDescription> =
-            serde_json::from_str(r#"[{"tenantId":"tenant-b","displayName":"Tenant B"}]"#).unwrap();
+            serde_json::from_str(r#"[{"tenantId":"tenant-b","displayName":"Tenant B"},{"tenantId":"tenant-b","defaultDomain":"b.example"}]"#).unwrap();
         AzureCli::merge_tenant_metadata(&mut descriptions, &metadata);
         let mut app = App::new(true);
-        app.loading = false;
-        app.subscriptions = subscriptions;
-        app.tenants = tenants_from_subscriptions(&app.subscriptions, &descriptions);
-        app.refresh_filter();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(LoadedAccounts::Cached(subscriptions, vec![]))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "subscription-b");
+        sender.send(LoadedAccounts::Tenants(descriptions)).unwrap();
+        app.receive_accounts(&receiver);
+        assert_eq!(app.selected().unwrap().id, "subscription-b");
 
         let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -691,6 +934,95 @@ mod tests {
         assert!(rendered.contains("Tenant B"));
         assert!(rendered.contains("tenant-a"));
         assert!(rendered.contains("tenant-b"));
+    }
+
+    #[test]
+    fn background_updates_preserve_query_and_selected_id() {
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(LoadedAccounts::Cached(subscriptions(), vec![]))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        app.append_query("hr");
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "1");
+        let mut updated = subscriptions();
+        updated[1].name = "HR Zebra".to_owned();
+        updated.reverse();
+        sender
+            .send(LoadedAccounts::Subscriptions(updated.into()))
+            .unwrap();
+
+        app.receive_accounts(&receiver);
+
+        assert_eq!(app.query, "hr");
+        assert_eq!(app.selected().unwrap().id, "1");
+    }
+
+    #[test]
+    fn removed_selection_requires_explicit_navigation_before_enter() {
+        let mut app = loaded_app();
+        app.loading = true;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let updated: Vec<_> = subscriptions().into_iter().skip(1).collect();
+        sender
+            .send(LoadedAccounts::Subscriptions(updated.into()))
+            .unwrap();
+
+        app.receive_accounts(&receiver);
+
+        assert!(app.selected().is_none());
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        app.receive_accounts(&receiver);
+        assert!(app.selected().is_none());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "2");
+    }
+
+    #[test]
+    fn fresh_subscriptions_are_searchable_before_tenant_metadata_arrives() {
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        app.append_query("hr");
+        assert!(app.loading);
+        assert_eq!(app.selected().unwrap().id, "2");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
+    }
+
+    #[test]
+    fn failed_revalidation_keeps_cached_selection_available() {
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(LoadedAccounts::Cached(subscriptions(), vec![]))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        app.append_query("hr");
+        app.next();
+        sender
+            .send(LoadedAccounts::Failed("sign in required".to_owned()))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        assert!(!app.loading);
+        assert!(app.cached);
+        assert!(app.load_error.is_some());
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
     }
 
     #[test]
