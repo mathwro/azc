@@ -40,7 +40,7 @@ pub fn ranked_tenant_indices(query: &str, tenants: &[Tenant]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, tenant)| {
             score_tenant(&query, tenant)
-                .map(|score| (index, score, tenant.id.to_lowercase(), tenant.is_current))
+                .map(|score| (index, score, tenant.name.to_lowercase(), tenant.is_current))
         })
         .collect::<Vec<_>>();
 
@@ -98,11 +98,12 @@ fn score_tenant(query: &str, tenant: &Tenant) -> Option<MatchScore> {
 
     let name = tenant.name.to_lowercase();
     let id = tenant.id.to_lowercase();
-    if name == query || id == query {
+    let domain = tenant.default_domain.to_lowercase();
+    if name == query || domain == query || id == query {
         Some(MatchScore(0))
-    } else if name.starts_with(query) || id.starts_with(query) {
+    } else if name.starts_with(query) || domain.starts_with(query) || id.starts_with(query) {
         Some(MatchScore(1))
-    } else if name.contains(query) || id.contains(query) {
+    } else if name.contains(query) || domain.contains(query) || id.contains(query) {
         Some(MatchScore(2))
     } else {
         None
@@ -322,6 +323,7 @@ mod tests {
             Tenant {
                 id: "aaaaaaaa".to_owned(),
                 name: "Tenant A".to_owned(),
+                default_domain: String::new(),
                 subscription_index: 0,
                 subscription_count: 1,
                 is_current: false,
@@ -329,6 +331,7 @@ mod tests {
             Tenant {
                 id: "bbbbbbbb".to_owned(),
                 name: "Tenant B".to_owned(),
+                default_domain: String::new(),
                 subscription_index: 1,
                 subscription_count: 2,
                 is_current: true,
@@ -352,6 +355,7 @@ mod tests {
             Tenant {
                 id: "aaaa-one".to_owned(),
                 name: "Tenant One".to_owned(),
+                default_domain: String::new(),
                 subscription_index: 0,
                 subscription_count: 1,
                 is_current: false,
@@ -359,6 +363,7 @@ mod tests {
             Tenant {
                 id: "aaaa-two".to_owned(),
                 name: "Tenant Two".to_owned(),
+                default_domain: String::new(),
                 subscription_index: 1,
                 subscription_count: 1,
                 is_current: false,

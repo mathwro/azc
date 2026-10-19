@@ -182,6 +182,7 @@ struct App {
     awaiting_refresh: bool,
     load_error: Option<String>,
     tenant_mode: bool,
+    tenant_scope: Option<String>,
 }
 
 impl App {
@@ -200,6 +201,7 @@ impl App {
             awaiting_refresh: false,
             load_error: None,
             tenant_mode,
+            tenant_scope: None,
         }
     }
 
@@ -256,29 +258,34 @@ impl App {
         let selected_id = selected_index
             .and_then(|index| previous.get(index))
             .map(|subscription| subscription.id.as_str());
-        self.tenants = tenants_from_subscriptions(&self.subscriptions, &self.descriptions);
+        let previous_tenants = std::mem::replace(
+            &mut self.tenants,
+            tenants_from_subscriptions(&self.subscriptions, &self.descriptions),
+        );
+        let selected_tenant_id = self
+            .list_state
+            .selected()
+            .and_then(|selected| self.filtered.get(selected))
+            .and_then(|&index| previous_tenants.get(index))
+            .map(|tenant| tenant.id.as_str());
         self.refresh_filter();
         if self.has_accounts {
-            let selected = selected_id.and_then(|id| {
-                let subscription_index = self
-                    .subscriptions
-                    .iter()
-                    .position(|subscription| subscription.id == id)?;
-                if self.tenant_mode {
-                    let tenant_index = self.tenants.iter().position(|tenant| {
-                        tenant.id == self.subscriptions[subscription_index].tenant_id
-                    })?;
-                    // Keep the actual switch target stable even if the active subscription changed.
-                    self.tenants[tenant_index].subscription_index = subscription_index;
+            let selected = if self.tenant_mode {
+                selected_tenant_id.and_then(|id| {
+                    self.filtered.iter().position(|&index| {
+                        self.tenants[index]
+                            .id
+                            .trim()
+                            .eq_ignore_ascii_case(id.trim())
+                    })
+                })
+            } else {
+                selected_id.and_then(|id| {
                     self.filtered
                         .iter()
-                        .position(|&index| index == tenant_index)
-                } else {
-                    self.filtered
-                        .iter()
-                        .position(|&index| index == subscription_index)
-                }
-            });
+                        .position(|&index| self.subscriptions[index].id == id)
+                })
+            };
             self.list_state.select(selected);
         }
         self.has_accounts = true;
@@ -311,6 +318,7 @@ impl App {
                 }
                 KeyCode::Char('t') => {
                     self.tenant_mode = !self.tenant_mode;
+                    self.tenant_scope = None;
                     self.query.clear();
                     self.refresh_filter();
                     None
@@ -334,7 +342,17 @@ impl App {
 
         match key.code {
             KeyCode::Esc => Some(Action::Cancel),
-            KeyCode::Enter if self.selected().is_some() => Some(Action::Select),
+            KeyCode::Enter if self.selected().is_some() => {
+                if self.tenant_mode {
+                    self.tenant_scope = Some(self.selected()?.tenant_id.clone());
+                    self.tenant_mode = false;
+                    self.query.clear();
+                    self.refresh_filter();
+                    None
+                } else {
+                    Some(Action::Select)
+                }
+            }
             KeyCode::Up => {
                 self.previous();
                 None
@@ -375,7 +393,16 @@ impl App {
         self.filtered = if self.tenant_mode {
             ranked_tenant_indices(&self.query, &self.tenants)
         } else {
-            ranked_indices(&self.query, &self.subscriptions)
+            let mut indices = ranked_indices(&self.query, &self.subscriptions);
+            if let Some(tenant_id) = &self.tenant_scope {
+                indices.retain(|&index| {
+                    self.subscriptions[index]
+                        .tenant_id
+                        .trim()
+                        .eq_ignore_ascii_case(tenant_id.trim())
+                });
+            }
+            indices
         };
         self.list_state
             .select((!self.filtered.is_empty()).then_some(0));
@@ -500,25 +527,19 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::new()
                 };
 
-                let tenant_name = if tenant.name.is_empty() {
-                    tenant.id.as_str()
-                } else {
-                    tenant.name.as_str()
-                };
-                let tenant_details = if tenant_name.eq_ignore_ascii_case(&tenant.id) {
-                    format!("  {} subscription(s)", tenant.subscription_count)
-                } else {
-                    format!(
-                        "  {} · {} subscription(s)",
-                        tenant.id, tenant.subscription_count
-                    )
-                };
-
-                ListItem::new(Line::from(vec![
-                    Span::styled(marker, marker_style),
-                    Span::styled(tenant_name.to_owned(), id_style),
-                    Span::styled(tenant_details, Style::new().fg(Color::DarkGray)),
-                ]))
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(marker, marker_style),
+                        Span::styled(tenant.label(), id_style),
+                    ]),
+                    Line::styled(
+                        format!(
+                            "  {} · {} subscription(s)",
+                            tenant.id, tenant.subscription_count
+                        ),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ])
             })
             .collect::<Vec<_>>()
     } else {
@@ -568,14 +589,22 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             },
         );
+    let list_name = if app.tenant_mode {
+        "Tenants".to_owned()
+    } else if let Some(id) = &app.tenant_scope {
+        let label = app
+            .tenants
+            .iter()
+            .find(|tenant| tenant.id.trim().eq_ignore_ascii_case(id.trim()))
+            .map_or_else(|| id.clone(), Tenant::label);
+        format!("Subscriptions in {label}")
+    } else {
+        "Subscriptions".to_owned()
+    };
     let title = if app.loading {
         format!(
             " {} · {} ",
-            if app.tenant_mode {
-                "Tenants"
-            } else {
-                "Subscriptions"
-            },
+            list_name,
             if app.refreshing && app.cached {
                 "cached · refreshing Azure…"
             } else if app.refreshing {
@@ -596,16 +625,22 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(
             " {} · {} of {} · current tenant {} ",
-            if app.tenant_mode {
-                "Tenants"
-            } else {
-                "Subscriptions"
-            },
+            list_name,
             app.filtered.len(),
             if app.tenant_mode {
                 app.tenants.len()
             } else {
-                app.subscriptions.len()
+                app.subscriptions
+                    .iter()
+                    .filter(|subscription| {
+                        app.tenant_scope.as_ref().is_none_or(|id| {
+                            subscription
+                                .tenant_id
+                                .trim()
+                                .eq_ignore_ascii_case(id.trim())
+                        })
+                    })
+                    .count()
             },
             current_tenant
         )
@@ -661,7 +696,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
     let status = if app.selected().is_some() {
         format!(
-            " Enter switch · Ctrl+R refresh · Ctrl+T {} · Esc cancel · current tenant {} ",
+            " Enter {} · Ctrl+R refresh · Ctrl+T {} · Esc cancel · current tenant {} ",
+            if app.tenant_mode {
+                "subscriptions"
+            } else {
+                "switch"
+            },
             if app.tenant_mode {
                 "subscriptions"
             } else {
@@ -934,6 +974,123 @@ mod tests {
         assert!(rendered.contains("Tenant B"));
         assert!(rendered.contains("tenant-a"));
         assert!(rendered.contains("tenant-b"));
+    }
+
+    #[test]
+    fn tenant_labels_use_names_domains_and_secondary_ids_from_json() {
+        let subscriptions: Vec<Subscription> = serde_json::from_str(
+            r#"[{"id":"a","name":"Alpha","tenantId":"tenant-a"},
+                {"id":"b","name":"Beta","tenantId":"tenant-b"},
+                {"id":"c","name":"Gamma","tenantId":"tenant-c"},
+                {"id":"d","name":"Delta","tenantId":"tenant-d"}]"#,
+        )
+        .unwrap();
+        let mut descriptions = serde_json::from_str(
+            r#"[{"tenantId":"tenant-a","displayName":"  GN Store Nord  ","defaultDomain":null},
+                {"tenantId":"tenant-b","displayName":"11111111-2222-3333-4444-555555555555"},
+                {"tenantId":"tenant-c","displayName":"  "},
+                {"tenantId":"tenant-c","displayName":"Tenant C"}]"#,
+        )
+        .unwrap();
+        let metadata: Vec<TenantDescription> = serde_json::from_str(
+            r#"[{"tenantId":"tenant-a","displayName":null,"defaultDomain":null},
+                {"tenantId":" TENANT-A ","defaultDomain":" gn.group "},
+                {"tenantId":"tenant-b","defaultDomain":"jabra4.onmicrosoft.com"}]"#,
+        )
+        .unwrap();
+        AzureCli::merge_tenant_metadata(&mut descriptions, &metadata);
+        let mut app = App::new(true);
+        app.descriptions = descriptions;
+        app.replace_subscriptions(subscriptions.into());
+        app.loading = false;
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        let frame = terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let lines: Vec<String> = frame
+            .buffer
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        for (label, id) in [
+            ("GN Store Nord (gn.group)", "tenant-a"),
+            ("jabra4.onmicrosoft.com", "tenant-b"),
+            ("Tenant C", "tenant-c"),
+        ] {
+            let row = lines.iter().position(|line| line.contains(label)).unwrap();
+            assert!(!lines[row].contains(id));
+            assert!(lines[row + 1].contains(id));
+        }
+        assert!(lines.iter().any(|line| line.contains("tenant-d")));
+        assert!(!lines.iter().any(|line| line.contains("11111111-2222")));
+        app.append_query("gn.group");
+        assert_eq!(app.selected().unwrap().id, "a");
+    }
+
+    #[test]
+    fn tenant_enter_opens_only_its_subscriptions_before_selecting() {
+        let mut app = loaded_app();
+        let mut subscriptions = subscriptions();
+        subscriptions[1].tenant_id = " Other-Tenant ".to_owned();
+        subscriptions[2].tenant_id = "other-tenant".to_owned();
+        app.replace_subscriptions(subscriptions.into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.append_query("other");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert!(!app.tenant_mode);
+        assert!(app.query.is_empty());
+        assert_eq!(app.filtered.len(), 2);
+        assert_eq!(app.selected().unwrap().id, "2");
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
+        app.append_query("Finance");
+        assert!(app.selected().is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.tenant_mode);
+        assert_eq!(app.filtered.len(), 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.filtered.len(), 3);
+    }
+
+    #[test]
+    fn scoped_subscription_updates_never_select_a_different_tenant() {
+        let mut app = loaded_app();
+        let mut initial = subscriptions();
+        initial[1].tenant_id = "other".to_owned();
+        initial[2].tenant_id = "other".to_owned();
+        app.replace_subscriptions(initial.clone().into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.append_query("other");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        app.append_query("hr");
+        app.next();
+        initial.reverse();
+        app.replace_subscriptions(initial.clone().into());
+        assert_eq!(app.query, "hr");
+        assert_eq!(app.selected().unwrap().id, "1");
+        initial.retain(|subscription| subscription.tenant_id != "other");
+        app.replace_subscriptions(initial.into());
+        assert!(app.selected().is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.filtered.is_empty());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Action::Cancel)
+        );
     }
 
     #[test]
