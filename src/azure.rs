@@ -84,15 +84,14 @@ impl AzureCli {
                     .trim()
                     .eq_ignore_ascii_case(metadata.tenant_id.trim())
             }) {
-                if (description.display_name.is_empty()
-                    || description
-                        .display_name
-                        .eq_ignore_ascii_case(description.tenant_id.trim()))
-                    && !metadata.display_name.is_empty()
+                if description.meaningful_name().is_none()
+                    && let Some(name) = metadata.meaningful_name()
                 {
-                    description.display_name = metadata.display_name.clone();
+                    description.display_name = name.to_owned();
                 }
-                if description.default_domain.is_empty() && !metadata.default_domain.is_empty() {
+                if description.default_domain.trim().is_empty()
+                    && !metadata.default_domain.trim().is_empty()
+                {
                     description.default_domain = metadata.default_domain.clone();
                 }
             } else if !metadata.tenant_id.trim().is_empty() {

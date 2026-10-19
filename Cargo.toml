@@ -1,6 +1,6 @@
 [package]
 name = "azc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast subscription context switcher for Azure CLI"

@@ -129,9 +129,15 @@ INTERACTIVE KEYS:
     Ctrl+T              Switch between subscriptions and tenants
     Ctrl+R              Refresh subscriptions from Azure in the background
     Home/End            Jump to first/last match
-    Enter               Switch to selected subscription or tenant
+    Enter               Open tenant's subscriptions / switch to subscription
     Esc, Ctrl+C         Cancel
     Ctrl+U              Clear search
+
+TENANT PICKER:
+    Show display name (domain), or domain when the name is missing or a GUID.
+    Tenant IDs appear on a second line. Enter opens that tenant's subscriptions;
+    only subscription Enter changes context. Ctrl+T returns to tenants, then
+    toggles back to all subscriptions. Esc / Ctrl+C cancel without switching.
 
 INTERACTIVE LOADING:
     Show the last picker snapshot (up to seven days old), then update in

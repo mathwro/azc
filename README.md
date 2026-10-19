@@ -19,7 +19,7 @@ azc --version        # print version and reproducible build metadata
 - The TUI shows the active tenant in its title and footer.
 - `Ctrl+T` toggles between the subscription list and a tenant list.
 - The tenant picker groups enabled subscriptions by tenant and marks the active tenant.
-- Selecting a tenant switches to one of its subscriptions, which is how Azure CLI changes active tenant context.
+- Selecting a tenant opens its subscriptions; only selecting a subscription changes Azure CLI context.
 - The TUI is in search mode from its first frame—just start typing.
 - Azure CLI loading runs in the background, so it does not block keyboard input.
 - Recent picker results appear immediately while Azure CLI updates them in the background.
@@ -107,16 +107,18 @@ Run `azc` without a query. Printable characters immediately filter subscription 
 | `Ctrl+T` | Toggle between subscriptions and tenants |
 | `Ctrl+R` | Refresh subscriptions from Azure without leaving the picker |
 | `Home` / `End` | Jump to the first / last match |
-| `Enter` | Switch to the selected subscription or tenant |
+| `Enter` | Open the selected tenant's subscriptions, or switch to the selected subscription |
 | `Backspace` | Remove the last query character |
 | `Ctrl+U` | Clear the query |
 | `Esc` / `Ctrl+C` | Cancel without changing context |
 
-The subscription list marks the current subscription with a green dot. Tenant mode groups enabled subscriptions by tenant, displays each tenant's Azure directory name and ID, marks the current tenant, and shows its subscription count. Selecting a tenant switches to one of its subscriptions, exits the TUI, restores the terminal, and prints the tenant ID plus switch target.
+The subscription list marks the current subscription with a green dot. Tenant mode groups enabled subscriptions by tenant, marks the current tenant, and shows its subscription count. Each tenant uses `Display name (domain)` with the tenant ID on a muted second line. Missing, blank, or GUID-only display names fall back to the domain, then the tenant ID when no friendly metadata is available.
+
+Press `Enter` on a tenant to open only that tenant's subscriptions, with a fresh search field. This does not change Azure CLI context or exit the picker—even when the tenant has only one subscription. Choose a subscription and press `Enter` again to switch by its ID, restore the terminal, and print the selected context. `Ctrl+T` returns to the tenant list; toggling again opens all subscriptions. `Esc` and `Ctrl+C` cancel from either list without switching.
 
 The subscription and tenant pickers first show the last successful subscription list if it is no more than seven days old, marked **cached · updating…**. Azure CLI then reloads subscriptions in the background, followed by tenant names. On a first run, subscriptions become searchable without waiting for tenant metadata.
 
-Updates preserve your search text and highlighted subscription ID. If the selected subscription disappears or no longer matches, the selection clears: navigate or edit the search before pressing Enter. You can select a cached subscription before updating finishes; Azure CLI handles the switch by ID. If Azure CLI rejects that context as missing or requests authentication, `azc` offers sign-in before retrying that same ID, never a replacement. If background listing fails, cached results remain available with an error indicator.
+Updates preserve your search text and highlighted subscription ID, or highlighted tenant ID in tenant mode. After opening a tenant, searches and background refreshes remain restricted to that tenant's subscriptions. If the selected subscription disappears or no longer matches, the selection clears: navigate or edit the search before pressing Enter. You can select a cached subscription before updating finishes; Azure CLI handles the switch by ID. If Azure CLI rejects that context as missing or requests authentication, `azc` offers sign-in before retrying that same ID, never a replacement. If background listing fails, cached results remain available with an error indicator.
 
 Press `Ctrl+R` in either picker to request a server refresh, just like `--refresh`. The current list stays usable while subscriptions and tenant names reload, and the successful results update the cache. If startup loading is still running, one refresh is queued behind it and superseded startup results are ignored. Further `Ctrl+R` presses are ignored until that refresh finishes. A failed refresh keeps the existing list and shows the error; press `Ctrl+R` again to retry. Refreshing itself never changes Azure context.
 
@@ -268,8 +270,8 @@ Publish a stable release:
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.3.0 -m "azc v0.3.0"
-git push origin v0.3.0
+git tag -a v0.4.0 -m "azc v0.4.0"
+git push origin v0.4.0
 ```
 
 The stable tag run repeats the dry-run checks with locked dependencies and waits at the protected `release` environment before creating and publishing the immutable GitHub Release. Stable publication then calls the central notifier, which verifies the exact release and sends the canonical package update event.

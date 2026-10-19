@@ -17,19 +17,53 @@ pub struct Subscription {
 #[serde(rename_all = "camelCase")]
 pub struct TenantDescription {
     pub tenant_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub display_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub default_domain: String,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+impl TenantDescription {
+    pub fn meaningful_name(&self) -> Option<&str> {
+        let name = self.display_name.trim();
+        let is_guid = name.len() == 36
+            && name.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            });
+        (!name.is_empty() && !is_guid && !name.eq_ignore_ascii_case(self.tenant_id.trim()))
+            .then_some(name)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tenant {
     pub id: String,
     pub name: String,
+    pub default_domain: String,
     pub subscription_index: usize,
     pub subscription_count: usize,
     pub is_current: bool,
+}
+
+impl Tenant {
+    pub fn label(&self) -> String {
+        match (self.name.is_empty(), self.default_domain.is_empty()) {
+            (false, false) if !self.name.eq_ignore_ascii_case(&self.default_domain) => {
+                format!("{} ({})", self.name, self.default_domain)
+            }
+            (false, _) => self.name.clone(),
+            (true, false) => self.default_domain.clone(),
+            (true, true) => self.id.clone(),
+        }
+    }
 }
 
 pub fn tenants_from_subscriptions(
@@ -55,24 +89,27 @@ pub fn tenants_from_subscriptions(
                 tenant.subscription_index = subscription_index;
             }
         } else {
-            let name = descriptions
-                .iter()
-                .find(|description| {
+            let matching = || {
+                descriptions.iter().filter(|description| {
                     description
                         .tenant_id
                         .trim()
                         .eq_ignore_ascii_case(subscription.tenant_id.trim())
                 })
-                .map_or_else(String::new, |description| {
-                    if description.display_name.is_empty() {
-                        description.default_domain.clone()
-                    } else {
-                        description.display_name.clone()
-                    }
-                });
+            };
+            let default_domain = matching()
+                .map(|description| description.default_domain.trim())
+                .find(|domain| !domain.is_empty())
+                .unwrap_or_default()
+                .to_owned();
+            let name = matching()
+                .find_map(TenantDescription::meaningful_name)
+                .unwrap_or(&default_domain)
+                .to_owned();
             tenants.push(Tenant {
                 id: subscription.tenant_id.clone(),
                 name,
+                default_domain,
                 subscription_index,
                 subscription_count: 1,
                 is_current: subscription.is_default,
@@ -131,6 +168,7 @@ mod tenant_tests {
                 super::Tenant {
                     id: "tenant-a".to_owned(),
                     name: "Tenant A".to_owned(),
+                    default_domain: "tenant-a.example".to_owned(),
                     subscription_index: 1,
                     subscription_count: 2,
                     is_current: true,
@@ -138,6 +176,7 @@ mod tenant_tests {
                 super::Tenant {
                     id: "tenant-b".to_owned(),
                     name: "Tenant B".to_owned(),
+                    default_domain: "tenant-b.example".to_owned(),
                     subscription_index: 2,
                     subscription_count: 1,
                     is_current: false,
@@ -201,6 +240,18 @@ mod tests {
 
         assert_eq!(description.display_name, "Tenant A");
         assert_eq!(description.default_domain, "tenant-a.example");
+    }
+
+    #[test]
+    fn tolerates_null_tenant_metadata_fields() {
+        let description: TenantDescription = serde_json::from_str(
+            r#"{"tenantId":"tenant-a","displayName":null,"defaultDomain":null}"#,
+        )
+        .unwrap();
+        let subscriptions: Vec<Subscription> =
+            serde_json::from_str(r#"[{"id":"a","name":"Alpha","tenantId":"tenant-a"}]"#).unwrap();
+        let tenants = super::tenants_from_subscriptions(&subscriptions, &[description]);
+        assert_eq!(tenants[0].label(), "tenant-a");
     }
 
     #[test]
