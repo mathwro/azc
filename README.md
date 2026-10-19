@@ -116,7 +116,7 @@ The subscription list marks the current subscription with a green dot. Tenant mo
 
 The subscription and tenant pickers first show the last successful subscription list if it is no more than seven days old, marked **cached · updating…**. Azure CLI then reloads subscriptions in the background, followed by tenant names. On a first run, subscriptions become searchable without waiting for tenant metadata.
 
-Updates preserve your search text and highlighted subscription ID. If the selected subscription disappears or no longer matches, the selection clears: navigate or edit the search before pressing Enter. You can select a cached subscription before updating finishes; Azure CLI handles the switch by ID and any failure is reported without choosing a replacement. If background listing fails, cached results remain available with an error indicator.
+Updates preserve your search text and highlighted subscription ID. If the selected subscription disappears or no longer matches, the selection clears: navigate or edit the search before pressing Enter. You can select a cached subscription before updating finishes; Azure CLI handles the switch by ID. If Azure CLI rejects that context as missing or requests authentication, `azc` offers sign-in before retrying that same ID, never a replacement. If background listing fails, cached results remain available with an error indicator.
 
 Press `Ctrl+R` in either picker to request a server refresh, just like `--refresh`. The current list stays usable while subscriptions and tenant names reload, and the successful results update the cache. If startup loading is still running, one refresh is queued behind it and superseded startup results are ignored. Further `Ctrl+R` presses are ignored until that refresh finishes. A failed refresh keeps the existing list and shows the error; press `Ctrl+R` again to retry. Refreshing itself never changes Azure context.
 
@@ -152,9 +152,18 @@ az account list --output json --only-show-errors [--refresh]
 az rest --method get --url "https://management.azure.com/tenants?api-version=2022-12-01" --query "value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain}" --output json
 az account list --all --query "[].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain}" --output json
 az account set --subscription <id> --only-show-errors
+az login [--tenant <tenant-id>] --output none
 ```
 
 The ordinary subscription list uses Azure CLI's local account data. `--refresh` adds Azure CLI's `--refresh` option to retrieve current subscriptions from Azure. The tenant picker gets tenant IDs, display names, and default domains from the Azure Resource Manager tenants endpoint through `az rest`, then fills missing metadata from the filtered local `az account list --all` query. If tenant metadata is unavailable, it falls back to tenant IDs. Switching a tenant means selecting one of its subscriptions by ID; Azure CLI then makes that subscription and its tenant active.
+
+Azure CLI child processes receive `PYTHONIOENCODING=utf-8` so subscription and tenant labels retain their Unicode characters. The official Windows launcher uses an isolated Python interpreter that ignores this variable; when its output is not valid UTF-8, `azc` decodes it using the Windows system ANSI code page before parsing JSON. This also supports Linux `azc` in WSL invoking Windows Azure CLI through a Scoop or other interop shim: a fixed, noninteractive `powershell.exe` command queries the Windows ANSI code page once per run, only when non-UTF-8 output requires it. Missing interop tooling, unsupported encodings, invalid JSON, or missing required subscription fields still produce errors; characters are not silently replaced. This does not change your terminal, system locale, or Azure CLI installation.
+
+If switching fails because the selected subscription is missing from Azure CLI's account data or Azure CLI requests authentication, `azc` restores the terminal and asks whether to sign in and retry. Sign-in is opt-in (`[y/N]`); Enter or any answer other than `y`/`yes` cancels successfully without starting login. This applies to subscription and tenant selections, in both direct and picker modes.
+
+After confirmation, `azc` runs `az login --tenant <tenant-id> --output none` (omitting `--tenant` when metadata is unavailable), with Azure CLI's normal browser/MFA instructions visible. It disables Azure CLI's subscription selector for that child process only, without changing saved configuration, then retries the originally selected subscription ID once. Login may update Azure CLI's account data and defaults. A failed login stops recovery; a failed retry reports Azure CLI's error without prompting again or selecting another subscription. Unrelated switching errors are still reported directly.
+
+When stdin or stderr is not a terminal, `azc` never prompts or starts login. It exits nonzero with the original diagnostic and a tenant-specific `az login` instruction instead.
 
 See Microsoft's [`az account` reference](https://learn.microsoft.com/cli/azure/account?view=azure-cli-latest) for the underlying command behavior.
 
@@ -185,13 +194,20 @@ Confirm that `az --version` works in the same terminal. Otherwise install Azure 
 
 ### Azure CLI asks you to sign in
 
-Run:
+If this happens while switching to a selected subscription or tenant, accept `azc`'s sign-in prompt and complete Azure CLI's browser/MFA flow. A missing-subscription error can also mean access was removed or the active Azure cloud is wrong; signing in is a recovery option, not proof that a session expired.
+
+For errors during listing, or when running without a terminal, sign in manually and retry:
 
 ```sh
-az login
+az login --tenant <tenant-id>
+azc
 ```
 
-Then retry `azc`. Authentication errors are returned directly from Azure CLI.
+Omit `--tenant` if the tenant ID is unknown. See Microsoft's [interactive sign-in guidance](https://learn.microsoft.com/cli/azure/authenticate-azure-cli-interactively?view=azure-cli-latest) for browser, MFA, and device-code options.
+
+### `invalid unicode code point` while loading accounts
+
+This is an output-encoding failure, not an expired-session message. Older `azc` builds assumed all Azure CLI JSON was UTF-8, but Windows Azure CLI can emit legacy-encoded bytes when its output is captured, including when invoked from WSL. Rebuild or update `azc` to use the decoding behavior described above. Custom `AZC_AZ_BIN` launchers should emit UTF-8, or the Windows system ANSI code page when invoking Windows Azure CLI. WSL interop requires `powershell.exe` on `PATH` to identify that code page.
 
 ### A new subscription is missing
 

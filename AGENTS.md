@@ -46,6 +46,10 @@ az account set --subscription <id> --only-show-errors
 
 `AZC_AZ_BIN` overrides executable discovery. On Windows, default discovery must continue to support `az.exe`, `az.cmd`, and `az.bat` on `PATH`.
 
+Keep Azure CLI integration installation-agnostic: support platform installers, package managers, Python installations, and custom launchers through the executable contract above. Handle the actual process boundary, including Linux `azc` invoking Windows Azure CLI through WSL; the platform compiling `azc` alone does not determine the child's output encoding. Cover native and cross-boundary execution when changing discovery or decoding, rather than validating only the installation that exposed the bug.
+
+Azure CLI remains a runtime dependency. If it is unavailable, return an actionable installation or `AZC_AZ_BIN` error; cached picker data does not substitute for authentication or switching.
+
 ## Cargo update boundary
 
 The supported self-update contract is:

@@ -138,6 +138,17 @@ INTERACTIVE LOADING:
     the background. Subscriptions appear before tenant names finish loading.
     Direct queries never use the picker cache.
 
+AUTHENTICATION RECOVERY:
+    If a selected context is missing or needs authentication, offer az login
+    for its tenant, then retry the same subscription ID once. Sign-in requires
+    y/yes confirmation; the default is to cancel. Without terminal input and
+    error output, print sign-in instructions instead of prompting.
+
+AZURE OUTPUT:
+    Request UTF-8 from Azure CLI. Support Windows system ANSI output both
+    natively and through WSL interop, without replacing Unicode characters.
+    WSL encoding detection uses powershell.exe on PATH only when needed.
+
 ENVIRONMENT:
     AZC_AZ_BIN           Azure CLI executable override (default: az)
     AZURE_CONFIG_DIR     Azure configuration and picker cache directory

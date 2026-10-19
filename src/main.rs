@@ -7,12 +7,17 @@ mod tui;
 mod updater;
 mod version;
 
-use std::{env, error::Error, process::ExitCode};
+use std::{
+    env,
+    error::Error,
+    io::{self, IsTerminal, Write},
+    process::ExitCode,
+};
 
-use azure::AzureCli;
+use azure::{AzureCli, AzureError};
 use cli::Command;
 use matcher::{unique_match, unique_tenant_match};
-use model::tenants_from_subscriptions;
+use model::{Subscription, tenants_from_subscriptions};
 
 fn main() -> ExitCode {
     match run() {
@@ -41,7 +46,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         Command::Interactive { refresh } => {
             let azure = AzureCli::from_env();
             if let Some(subscription) = tui::choose_subscription(azure.clone(), refresh)? {
-                azure.set_subscription(&subscription.id)?;
+                if !switch_subscription(&azure, &subscription, confirm_reauthentication)? {
+                    return Ok(());
+                }
                 println!(
                     "Switched to {} ({}) in tenant {}",
                     subscription.name, subscription.id, subscription.tenant_id
@@ -52,7 +59,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             let azure = AzureCli::from_env();
             let subscriptions = azure.list_subscriptions(refresh)?;
             let subscription = unique_match(&query, &subscriptions)?;
-            azure.set_subscription(&subscription.id)?;
+            if !switch_subscription(&azure, subscription, confirm_reauthentication)? {
+                return Ok(());
+            }
             println!(
                 "Switched to {} ({}) in tenant {}",
                 subscription.name, subscription.id, subscription.tenant_id
@@ -72,7 +81,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 };
                 subscription
             };
-            azure.set_subscription(&subscription.id)?;
+            if !switch_subscription(&azure, &subscription, confirm_reauthentication)? {
+                return Ok(());
+            }
             println!(
                 "Switched to tenant {} via {} ({})",
                 subscription.tenant_id, subscription.name, subscription.id
@@ -81,4 +92,57 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn switch_subscription(
+    azure: &AzureCli,
+    subscription: &Subscription,
+    confirm: impl FnOnce(&Subscription, &AzureError) -> Result<bool, Box<dyn Error>>,
+) -> Result<bool, Box<dyn Error>> {
+    match azure.set_subscription(&subscription.id) {
+        Ok(()) => return Ok(true),
+        Err(error) if error.requires_reauthentication() => {
+            if !confirm(subscription, &error)? {
+                return Ok(false);
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    azure.login(&subscription.tenant_id)?;
+    azure.set_subscription(&subscription.id)?;
+    Ok(true)
+}
+
+fn confirm_reauthentication(
+    subscription: &Subscription,
+    error: &AzureError,
+) -> Result<bool, Box<dyn Error>> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        let tenant = if subscription.tenant_id.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" --tenant {}", subscription.tenant_id)
+        };
+        return Err(format!(
+            "{error}\nAzure sign-in may have expired or access may have changed. Run 'az login{tenant}', then retry azc."
+        )
+        .into());
+    }
+
+    eprintln!(
+        "azc: Azure could not select {} ({}). Your sign-in may have expired or access may have changed.",
+        subscription.name, subscription.id
+    );
+    if !subscription.tenant_id.trim().is_empty() {
+        eprintln!(
+            "Sign in to tenant {} and retry this subscription? [y/N]",
+            subscription.tenant_id
+        );
+    } else {
+        eprintln!("Sign in to Azure and retry this subscription? [y/N]");
+    }
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
 }
