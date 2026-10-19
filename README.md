@@ -263,6 +263,8 @@ The project-specific contribution and verification contracts are in [`AGENTS.md`
 
 Before the first release, merge the shared workflow into `mathwro/homebrew-tools`, require the `CI` and `Workflow Lint` checks in `main` branch protection, create the protected `release` environment with required reviewers, and configure the `DISTRIBUTION_DISPATCH_TOKEN` repository secret. The token must be limited to sending repository dispatches to `mathwro/homebrew-tools`.
 
+Workflow lint runs on every pull request and push to `main`, without path filters, so its required branch-protection check is never skipped for source-only changes.
+
 For a complete dry run, set `Cargo.toml` to a prerelease version such as `0.1.0-rc.1`, merge it, and push the matching annotated tag. Prerelease tag pushes automatically run with `dry_run: true`: all six native archives and the complete staging artifact are produced, but no GitHub Release or package update is created. The workflow can also be dispatched manually for an existing tag.
 
 Publish a stable release:
