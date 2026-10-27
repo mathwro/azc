@@ -19,12 +19,12 @@ azc --version        # print version and reproducible build metadata
 - The TUI shows the active tenant in its title and footer.
 - `Ctrl+T` toggles between the subscription list and a tenant list.
 - The tenant picker groups enabled subscriptions by tenant and marks the active tenant.
-- Selecting a tenant opens its subscriptions; only selecting a subscription changes Azure CLI context.
+- In the full picker, selecting a tenant opens its subscriptions; selecting a subscription changes Azure CLI context.
 - The TUI is in search mode from its first frame—just start typing.
 - Azure CLI loading runs in the background, so it does not block keyboard input.
 - Recent picker results appear immediately while Azure CLI updates them in the background.
-- Direct mode ranks partial names predictably.
-- Ambiguous direct matches fail instead of selecting the wrong subscription.
+- Direct mode ranks partial names predictably, with separated name fragments as a fallback.
+- Ambiguous direct matches open a focused shortlist in a terminal instead of guessing.
 - Azure authentication stays in the installed Azure CLI; `azc` does not handle credentials or tokens.
 
 ## Requirements
@@ -104,19 +104,20 @@ Run `azc` without a query. Printable characters immediately filter subscription 
 | Type or paste | Filter the active list |
 | `Up` / `Down`, `Alt+j` / `Alt+k` | Move the selection |
 | `Ctrl+P` / `Ctrl+N` | Move the selection |
-| `Ctrl+T` | Toggle between subscriptions and tenants |
-| `Ctrl+R` | Refresh subscriptions from Azure without leaving the picker |
+| `Ctrl+T` | Toggle between subscriptions and tenants (full picker only) |
+| `Ctrl+R` | Refresh subscriptions from Azure (full picker only) |
+| `Ctrl+B` | Leave a shortlist for the full picker, clearing search and retaining the highlighted context |
 | `Home` / `End` | Jump to the first / last match |
-| `Enter` | Open the selected tenant's subscriptions, or switch to the selected subscription |
+| `Enter` | Open a tenant's subscriptions in the full picker; switch to a subscription or shortlisted tenant |
 | `Backspace` | Remove the last query character |
 | `Ctrl+U` | Clear the query |
 | `Esc` / `Ctrl+C` | Cancel without changing context |
 
 The subscription list marks the current subscription with a green dot. Tenant mode groups enabled subscriptions by tenant, marks the current tenant, and shows its subscription count. Each tenant uses `Display name (domain)` with the tenant ID on a muted second line. Missing, blank, or GUID-only display names fall back to the domain, then the tenant ID when no friendly metadata is available.
 
-Press `Enter` on a tenant to open only that tenant's subscriptions, with a fresh search field. This does not change Azure CLI context or exit the picker—even when the tenant has only one subscription. Choose a subscription and press `Enter` again to switch by its ID, restore the terminal, and print the selected context. `Ctrl+T` returns to the tenant list; toggling again opens all subscriptions. `Esc` and `Ctrl+C` cancel from either list without switching.
+In the full picker, press `Enter` on a tenant to open only that tenant's subscriptions, with a fresh search field. This does not change Azure CLI context or exit the picker—even when the tenant has only one subscription. Choose a subscription and press `Enter` again to switch by its ID, restore the terminal, and print the selected context. `Ctrl+T` returns to the tenant list; toggling again opens all subscriptions. `Esc` and `Ctrl+C` cancel from either list without switching.
 
-The subscription and tenant pickers first show the last successful subscription list if it is no more than seven days old, marked **cached · updating…**. Azure CLI then reloads subscriptions in the background, followed by tenant names. On a first run, subscriptions become searchable without waiting for tenant metadata.
+When opened without a query, the subscription and tenant pickers first show the last successful subscription list if it is no more than seven days old, marked **cached · updating…**. Azure CLI then reloads subscriptions in the background, followed by tenant names. On a first run, subscriptions become searchable without waiting for tenant metadata. Pickers opened from a direct query instead reuse that query's account data without another startup listing or reading a snapshot.
 
 Updates preserve your search text and highlighted subscription ID, or highlighted tenant ID in tenant mode. After opening a tenant, searches and background refreshes remain restricted to that tenant's subscriptions. If the selected subscription disappears or no longer matches, the selection clears: navigate or edit the search before pressing Enter. You can select a cached subscription before updating finishes; Azure CLI handles the switch by ID. If Azure CLI rejects that context as missing or requests authentication, `azc` offers sign-in before retrying that same ID, never a replacement. If background listing fails, cached results remain available with an error indicator.
 
@@ -135,15 +136,26 @@ The snapshot contains subscription IDs, names, tenant IDs, last-seen active mark
 3. Word prefix within the name
 4. Name substring
 5. Subscription ID or tenant ID substring
+6. Every whitespace-separated query fragment appears somewhere in the name, in any order
 
-`azc tenant <query>` applies exact, prefix, and substring matching to tenant display names, default domains, and IDs. A uniquely best-ranked tenant is switched by selecting one of its subscriptions:
+For example, `azc payments prod` can match `payments-platform-prod` or `prod-payments`. An existing contiguous match such as `payments prod` still ranks higher. The same ranking is used while typing in the picker. Fragment matching does not correct typos or infer abbreviations; single-fragment name and ID matching is unchanged.
+
+`azc tenant <query>` applies exact, prefix, and substring matching to tenant display names, default domains, and IDs, followed by the separated-fragment fallback for tenant names. A uniquely best-ranked tenant is switched using its current subscription when present, otherwise its first subscription returned by Azure CLI:
 
 ```text
 $ azc tenant 1000
 Switched to tenant 10000000-0000-0000-0000-000000000001 via HR Production (00000000-0000-0000-0000-000000000002)
 ```
 
-If multiple subscriptions or tenants tie at the best rank, `azc` exits without changing context and lists the ambiguous values. Use a longer query, or open the appropriate picker. `update`, `version`, and `tenant` are command names; search for subscriptions with those exact names using `azc -- update`, `azc -- version`, or `azc -- tenant`.
+With terminal input and output, equally best-ranked matches open a **shortlist containing only those subscriptions or tenants**. The original query is retained; typing or clearing search stays within that shortlist. `Enter` switches to the selected subscription, or to the selected tenant via its current/first subscription. `Esc` and `Ctrl+C` cancel without switching. No candidate is selected automatically to break a tie.
+
+Shortlists omit refresh and tenant-toggle controls. Press `Ctrl+B` to open the full corresponding list, clear the search, and retain the highlighted subscription or tenant. Normal controls resume, and tenant selection now opens its subscriptions before switching.
+
+If a direct query matches nothing, the full picker opens with the query ready to edit. Both recovery paths reuse the already-loaded account data; they do not repeat the startup subscription listing. Missing tenant metadata loads in the background without blocking subscription selection. An explicit `Ctrl+R` in the full picker still requests a new server refresh.
+
+When stdin or stdout is not a terminal, ambiguity and no-match cases instead exit nonzero with a diagnostic and no picker. Unique matches continue to switch directly in scripts.
+
+`update`, `version`, and `tenant` are command names; search for subscriptions with those exact names using `azc -- update`, `azc -- version`, or `azc -- tenant`.
 
 ## Azure CLI behavior
 
@@ -221,7 +233,7 @@ azc --refresh
 
 ### A direct query is ambiguous
 
-For subscriptions, add enough of the name to produce one best-ranked match, or run `azc` and choose interactively. For tenants, add more of the tenant ID or run `azc tenant`.
+In a terminal, choose from the automatically opened shortlist, or press `Ctrl+B` to clear the search and browse the full list. In scripts or redirected output, provide enough of the name or ID to produce one best-ranked match; ambiguous queries fail without switching.
 
 ## Project layout
 
@@ -247,6 +259,15 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+On Linux or macOS, also run the dependency-free Python 3 process/PTY suite (included in Linux CI):
+
+```sh
+cargo build --locked
+python3 scripts/test_context_switching.py
+```
+
+It uses isolated fake Azure accounts to check exact switched IDs, ambiguity and no-match recovery, shortlist escape, redirected streams, cancellation, terminal restoration, and selection while tenant metadata is blocked. No Azure login or live subscription is needed.
 
 Platform-sensitive changes can be compile-checked from a configured Rust toolchain:
 
