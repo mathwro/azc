@@ -8,7 +8,10 @@
 - Vim-style navigation uses `Alt+j` / `Alt+k`, leaving plain `j` and `k` available to search.
 - The TUI renders before `az account list` completes; subscription loading remains off the terminal event thread.
 - Interactive mode changes context only after `Enter`. `Esc` and `Ctrl+C` leave context unchanged.
-- Direct mode (`azc <query>`) switches only when the best match is unique. Equal-ranked matches return an ambiguity error rather than guessing.
+- Direct queries switch automatically only for a unique best match. With terminal stdin and stdout, ties open a tied-best shortlist and no match opens an editable full picker; otherwise return an error. Handoffs reuse loaded account data without a second startup listing or cache read.
+- Shortlists remain restricted while searching. `Ctrl+B` opens the full corresponding list, clears search, and preserves the highlighted ID; `Ctrl+T/R` are available only in the full picker. `Esc` and `Ctrl+C` always cancel.
+- Direct tenant queries and tenant shortlist selection use the tenant's current/first subscription. Full tenant pickers drill down to subscriptions before switching.
+- Separated name fragments must all match, in any order, below existing contiguous ranks. Keep single-fragment name and ID matching unchanged and ranking shared between direct and interactive paths.
 - Context changes use the selected subscription ID, not its display name.
 - Azure CLI is executed directly with `std::process::Command`; keep query and subscription data out of shell command strings.
 - Ordinary listing uses Azure CLI's local account data. `--refresh` bypasses picker snapshots; it and interactive `Ctrl+R` explicitly request a server refresh. Only interactive mode may show a recent last-run snapshot while reloading; direct queries always use Azure CLI output.
@@ -95,5 +98,7 @@ cargo check --target x86_64-apple-darwin
 ```
 
 For switching behavior, smoke-test both `azc <query>` and the interactive picker against a fake Azure executable supplied through `AZC_AZ_BIN`; assert the ID passed to `account set`. Never use a real subscription for automated verification.
+
+On POSIX, retain process/PTY regressions in `scripts/test_context_switching.py`; run `cargo build --locked` then `python3 scripts/test_context_switching.py`. Linux CI runs this suite. Keep fixtures isolated from real Azure configuration and synchronize on observable state rather than fixed startup sleeps.
 
 For update behavior, place a fake `cargo` executable first on `PATH`, run `azc update`, and assert the exact `install --git ... --locked --force` arguments. Never overwrite the developer's installed `azc` during automated verification.

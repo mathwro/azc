@@ -25,6 +25,12 @@ use crate::{
     model::{Subscription, Tenant, TenantDescription, tenants_from_subscriptions},
 };
 
+enum InitialLoad {
+    Accounts { refresh: bool },
+    TenantMetadata,
+    Ready,
+}
+
 enum LoadedAccounts {
     RefreshStarted,
     Cached(Vec<Subscription>, Vec<TenantDescription>),
@@ -51,14 +57,42 @@ pub fn choose_tenant(
     choose(azure, refresh, true)
 }
 
+pub fn choose_from_query(
+    azure: AzureCli,
+    subscriptions: Vec<Subscription>,
+    descriptions: Option<Vec<TenantDescription>>,
+    query: String,
+    tenant_mode: bool,
+    shortlist: Option<Vec<usize>>,
+) -> Result<Option<Subscription>, Box<dyn Error>> {
+    let initial_load = if descriptions.is_some() {
+        InitialLoad::Ready
+    } else {
+        InitialLoad::TenantMetadata
+    };
+    let app = App::from_query(subscriptions, descriptions, query, tenant_mode, shortlist);
+    choose_with_app(load_in_background(azure, initial_load), app)
+}
+
 fn choose(
     azure: AzureCli,
     refresh: bool,
     tenant_mode: bool,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
-    let loader = load_in_background(azure, refresh);
+    let mut app = App::new(tenant_mode);
+    app.refreshing = refresh;
+    choose_with_app(
+        load_in_background(azure, InitialLoad::Accounts { refresh }),
+        app,
+    )
+}
+
+fn choose_with_app(
+    loader: AccountLoader,
+    app: App,
+) -> Result<Option<Subscription>, Box<dyn Error>> {
     let mut terminal = ratatui::try_init()?;
-    let result = run(&mut terminal, loader, tenant_mode, refresh);
+    let result = run(&mut terminal, loader, app);
     let restore_result = ratatui::try_restore();
 
     match (result, restore_result) {
@@ -68,11 +102,20 @@ fn choose(
     }
 }
 
-fn load_in_background(azure: AzureCli, refresh: bool) -> AccountLoader {
+fn load_in_background(azure: AzureCli, initial_load: InitialLoad) -> AccountLoader {
     let (sender, accounts) = mpsc::channel();
     let (request, requests) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        if !load_accounts(&azure, refresh, &sender) {
+        let connected = match initial_load {
+            InitialLoad::Accounts { refresh } => load_accounts(&azure, refresh, &sender),
+            InitialLoad::TenantMetadata => sender
+                .send(LoadedAccounts::Tenants(
+                    azure.list_tenants().unwrap_or_default(),
+                ))
+                .is_ok(),
+            InitialLoad::Ready => true,
+        };
+        if !connected {
             return;
         }
         for () in requests {
@@ -131,12 +174,8 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
 fn run(
     terminal: &mut DefaultTerminal,
     loader: AccountLoader,
-    tenant_mode: bool,
-    refresh: bool,
+    mut app: App,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
-    let mut app = App::new(tenant_mode);
-    app.refreshing = refresh;
-
     loop {
         app.receive_accounts(&loader.accounts);
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -183,6 +222,7 @@ struct App {
     load_error: Option<String>,
     tenant_mode: bool,
     tenant_scope: Option<String>,
+    shortlist: Option<Vec<usize>>,
 }
 
 impl App {
@@ -202,7 +242,27 @@ impl App {
             load_error: None,
             tenant_mode,
             tenant_scope: None,
+            shortlist: None,
         }
+    }
+
+    fn from_query(
+        subscriptions: Vec<Subscription>,
+        descriptions: Option<Vec<TenantDescription>>,
+        query: String,
+        tenant_mode: bool,
+        shortlist: Option<Vec<usize>>,
+    ) -> Self {
+        let mut app = Self::new(tenant_mode);
+        app.loading = descriptions.is_none();
+        app.descriptions = descriptions.unwrap_or_default();
+        app.query = query;
+        app.shortlist = shortlist.map(|mut indices| {
+            indices.sort_unstable();
+            indices
+        });
+        app.replace_subscriptions(subscriptions.into());
+        app
     }
 
     fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) {
@@ -309,18 +369,36 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Some(Action::Cancel),
-                KeyCode::Char('r') if !self.refreshing => {
+                KeyCode::Char('r') if self.shortlist.is_none() && !self.refreshing => {
                     self.loading = true;
                     self.refreshing = true;
                     self.awaiting_refresh = true;
                     self.load_error = None;
                     Some(Action::Refresh)
                 }
-                KeyCode::Char('t') => {
+                KeyCode::Char('t') if self.shortlist.is_none() => {
                     self.tenant_mode = !self.tenant_mode;
                     self.tenant_scope = None;
                     self.query.clear();
                     self.refresh_filter();
+                    None
+                }
+                KeyCode::Char('b') if self.shortlist.is_some() => {
+                    let selected = self
+                        .list_state
+                        .selected()
+                        .and_then(|selected| self.filtered.get(selected))
+                        .copied();
+                    self.shortlist = None;
+                    self.query.clear();
+                    self.refresh_filter();
+                    if let Some(index) = selected {
+                        self.list_state.select(
+                            self.filtered
+                                .iter()
+                                .position(|&candidate| candidate == index),
+                        );
+                    }
                     None
                 }
                 KeyCode::Char('u') => {
@@ -343,7 +421,7 @@ impl App {
         match key.code {
             KeyCode::Esc => Some(Action::Cancel),
             KeyCode::Enter if self.selected().is_some() => {
-                if self.tenant_mode {
+                if self.tenant_mode && self.shortlist.is_none() {
                     self.tenant_scope = Some(self.selected()?.tenant_id.clone());
                     self.tenant_mode = false;
                     self.query.clear();
@@ -404,6 +482,10 @@ impl App {
             }
             indices
         };
+        if let Some(shortlist) = &self.shortlist {
+            self.filtered
+                .retain(|index| shortlist.binary_search(index).is_ok());
+        }
         self.list_state
             .select((!self.filtered.is_empty()).then_some(0));
     }
@@ -456,8 +538,7 @@ impl App {
     }
 
     fn select_last(&mut self) {
-        self.list_state
-            .select((!self.filtered.is_empty()).then_some(self.filtered.len() - 1));
+        self.list_state.select(self.filtered.len().checked_sub(1));
     }
 }
 
@@ -664,7 +745,11 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if !app.loading && app.load_error.is_none() && app.filtered.is_empty() {
         let message = if app.tenant_mode {
-            "No tenants with enabled subscriptions found"
+            if app.tenants.is_empty() {
+                "No tenants with enabled subscriptions found"
+            } else {
+                "No matching tenants"
+            }
         } else if app.subscriptions.is_empty() {
             "No enabled subscriptions found"
         } else {
@@ -680,6 +765,21 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if app.shortlist.is_some() {
+        let status = format!(
+            " Shortlist · {} · Ctrl+B full picker · Esc cancel ",
+            if app.selected().is_some() {
+                "Enter switch"
+            } else {
+                "Type to search"
+            }
+        );
+        frame.render_widget(
+            Paragraph::new(status).style(Style::new().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
     let current_tenant = app
         .tenants
         .iter()
@@ -772,6 +872,243 @@ mod tests {
         app.loading = false;
         app.replace_subscriptions(subscriptions().into());
         app
+    }
+
+    fn tenant_query_app(query: &str, shortlist: Option<Vec<usize>>) -> App {
+        let subscriptions = serde_json::from_str(
+            r#"[{"id":"a-first","name":"Production First","tenantId":"tenant-z"},
+                {"id":"a-current","name":"Production Current","tenantId":"tenant-z","isDefault":true},
+                {"id":"b-first","name":"Development First","tenantId":"tenant-a"},
+                {"id":"b-last","name":"Development Last","tenantId":"tenant-a"},
+                {"id":"outside","name":"Other","tenantId":"tenant-other"}]"#,
+        )
+        .unwrap();
+        let descriptions = serde_json::from_str(
+            r#"[{"tenantId":"tenant-z","displayName":"North Production","defaultDomain":null},
+                {"tenantId":"tenant-a","displayName":null,"defaultDomain":"development.example"},
+                {"tenantId":"tenant-a","displayName":"North Development"},
+                {"tenantId":"tenant-other","displayName":"Alpha Outside"}]"#,
+        )
+        .unwrap();
+        App::from_query(
+            subscriptions,
+            Some(descriptions),
+            query.to_owned(),
+            true,
+            shortlist,
+        )
+    }
+
+    #[test]
+    fn shortlist_never_exposes_lower_matches_or_outsiders_after_clearing() {
+        let mut subscriptions = subscriptions();
+        subscriptions.push(Subscription {
+            id: "lower".to_owned(),
+            name: "Archive HR".to_owned(),
+            tenant_id: "tenant".to_owned(),
+            is_default: false,
+            state: "Enabled".to_owned(),
+        });
+        let mut app = App::from_query(
+            subscriptions,
+            None,
+            "hr".to_owned(),
+            false,
+            Some(vec![2, 1]),
+        );
+        assert_eq!(app.filtered, vec![2, 1]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.query.is_empty());
+        assert_eq!(app.filtered, vec![2, 1]);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.selected().unwrap().id, "1");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().unwrap().id, "2");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        app.receive_accounts(&receiver);
+        assert!(!app.loading);
+        assert_eq!(app.filtered, vec![2, 1]);
+        assert_eq!(app.selected().unwrap().id, "2");
+        app.append_query("Finance");
+        assert!(app.selected().is_none());
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.selected().is_none());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.append_query("Production");
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
+    }
+
+    #[test]
+    fn shortlist_ignores_refresh_and_mode_toggle_but_still_cancels() {
+        for tenant_mode in [false, true] {
+            let mut app = App::from_query(
+                subscriptions(),
+                Some(vec![]),
+                String::new(),
+                tenant_mode,
+                Some(vec![0]),
+            );
+            for key in ['r', 't', 'r'] {
+                assert_eq!(
+                    app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL)),
+                    None
+                );
+            }
+            assert!(!app.loading);
+            assert!(!app.refreshing);
+            assert_eq!(app.tenant_mode, tenant_mode);
+            assert_eq!(app.selected().unwrap().id, "0");
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                Some(Action::Cancel)
+            );
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Some(Action::Cancel)
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_subscription_shortlist_preserves_id_and_restores_controls() {
+        let mut app = App::from_query(
+            subscriptions(),
+            Some(vec![]),
+            "hr".to_owned(),
+            false,
+            Some(vec![1, 2]),
+        );
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "1");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+
+        assert!(app.query.is_empty());
+        assert!(!app.tenant_mode);
+        assert_eq!(app.filtered.len(), 3);
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(Action::Refresh)
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            None
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.tenant_mode);
+    }
+
+    #[test]
+    fn tenant_shortlist_enter_selects_current_or_first_subscription_directly() {
+        let mut app = tenant_query_app("north", Some(vec![0, 1]));
+        assert_eq!(app.selected().unwrap().id, "a-current");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
+        assert!(app.tenant_mode);
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "b-first");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.filtered.len(), 2);
+        app.append_query("outside");
+        assert!(app.selected().is_none());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn leaving_tenant_shortlist_preserves_tenant_and_restores_drilldown() {
+        let mut app = tenant_query_app("north", Some(vec![0, 1]));
+        app.next();
+        assert_eq!(app.selected().unwrap().tenant_id, "tenant-a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+
+        assert!(app.query.is_empty());
+        assert!(app.tenant_mode);
+        assert_eq!(app.filtered.len(), 3);
+        assert_eq!(app.selected().unwrap().tenant_id, "tenant-a");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert!(!app.tenant_mode);
+        assert_eq!(app.filtered.len(), 2);
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "b-last");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
+    }
+
+    #[test]
+    fn unmatched_subscription_query_can_be_corrected_before_metadata_arrives() {
+        let mut app = App::from_query(subscriptions(), None, "financx".to_owned(), false, None);
+        assert!(app.loading);
+        assert_eq!(app.query, "financx");
+        assert!(app.selected().is_none());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(app.selected().unwrap().id, "0");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(app.query, "finance");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        app.receive_accounts(&receiver);
+        assert!(!app.loading);
+        assert_eq!(app.selected().unwrap().id, "0");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.filtered.len(), 3);
+    }
+
+    #[test]
+    fn unmatched_tenant_query_can_be_corrected_and_drills_down_normally() {
+        let mut app = tenant_query_app("north missing", None);
+        assert_eq!(app.query, "north missing");
+        assert!(app.selected().is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.append_query("development");
+        assert_eq!(app.selected().unwrap().tenant_id, "tenant-a");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert!(!app.tenant_mode);
+        assert_eq!(app.filtered.len(), 2);
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "b-last");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Select)
+        );
     }
 
     #[test]
@@ -1180,6 +1517,58 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(Action::Select)
         );
+    }
+
+    #[test]
+    fn seeded_refresh_ignores_pending_metadata_and_keeps_the_selected_subscription() {
+        let mut app = App::from_query(subscriptions(), None, "hr".to_owned(), false, None);
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(Action::Refresh)
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        app.receive_accounts(&receiver);
+        assert!(app.loading);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            None
+        );
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        app.receive_accounts(&receiver);
+        assert!(!app.loading);
+        assert_eq!(app.query, "hr");
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(Action::Refresh)
+        );
+    }
+
+    #[test]
+    fn seeded_tenant_shortlist_renders_supplied_labels_without_outsiders() {
+        let mut app = tenant_query_app("north", Some(vec![0, 1]));
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let frame = terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered: String = frame
+            .buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("North Production"));
+        assert!(rendered.contains("North Development"));
+        assert!(rendered.contains("development.example"));
+        assert!(rendered.contains("tenant-z"));
+        assert!(rendered.contains("tenant-a"));
+        assert!(!rendered.contains("Alpha Outside"));
+        assert!(!rendered.contains("tenant-other"));
     }
 
     #[test]
