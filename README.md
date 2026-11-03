@@ -97,7 +97,7 @@ It therefore requires Cargo, network access to GitHub, and permission to write t
 
 ## Interactive picker
 
-Run `azc` without a query. Printable characters immediately filter subscription names, subscription IDs, and tenant IDs. The footer shows the current tenant ID once account data is available; cached markers reflect the last snapshot until the background listing finishes.
+Run `azc` without a query to show subscriptions only from the active Azure CLI tenant. Printable characters immediately filter subscription names, subscription IDs, and tenant IDs within that tenant. The footer shows the current tenant ID once account data is available; cached markers and the default tenant reflect the last snapshot until the background listing finishes, then follow the live Azure CLI context.
 
 | Key | Action |
 | --- | --- |
@@ -114,7 +114,7 @@ Run `azc` without a query. Printable characters immediately filter subscription 
 
 The subscription list marks the current subscription with a green dot. Tenant mode groups enabled subscriptions by tenant, marks the current tenant, and shows its subscription count. Each tenant uses `Display name (domain)` with the tenant ID on a muted second line. Missing, blank, or GUID-only display names fall back to the domain, then the tenant ID when no friendly metadata is available.
 
-Press `Enter` on a tenant to open only that tenant's subscriptions, with a fresh search field. This does not change Azure CLI context or exit the picker—even when the tenant has only one subscription. Choose a subscription and press `Enter` again to switch by its ID, restore the terminal, and print the selected context. `Ctrl+T` returns to the tenant list; toggling again opens all subscriptions. `Esc` and `Ctrl+C` cancel from either list without switching.
+Press `Enter` on a tenant to open only that tenant's subscriptions, with a fresh search field. This does not change Azure CLI context or exit the picker—even when the tenant has only one subscription. Choose a subscription and press `Enter` again to switch by its ID, restore the terminal, and print the selected context. `Ctrl+T` returns to the tenant list; toggling again returns to the same tenant's subscriptions, or the active Azure CLI tenant if none was explicitly selected. `Esc` and `Ctrl+C` cancel from either list without switching.
 
 The subscription and tenant pickers first show the last successful subscription list if it is no more than seven days old, marked **cached · updating…**. Azure CLI then reloads subscriptions in the background, followed by tenant names. On a first run, subscriptions become searchable without waiting for tenant metadata.
 

@@ -134,10 +134,11 @@ INTERACTIVE KEYS:
     Ctrl+U              Clear search
 
 TENANT PICKER:
+    Subscriptions default to the active Azure CLI tenant.
     Show display name (domain), or domain when the name is missing or a GUID.
     Tenant IDs appear on a second line. Enter opens that tenant's subscriptions;
     only subscription Enter changes context. Ctrl+T returns to tenants, then
-    toggles back to all subscriptions. Esc / Ctrl+C cancel without switching.
+    back to the scoped subscriptions. Esc / Ctrl+C cancel without switching.
 
 INTERACTIVE LOADING:
     Show the last picker snapshot (up to seven days old), then update in

@@ -318,7 +318,6 @@ impl App {
                 }
                 KeyCode::Char('t') => {
                     self.tenant_mode = !self.tenant_mode;
-                    self.tenant_scope = None;
                     self.query.clear();
                     self.refresh_filter();
                     None
@@ -389,12 +388,21 @@ impl App {
         self.refresh_filter();
     }
 
+    fn scoped_tenant_id(&self) -> Option<&str> {
+        self.tenant_scope.as_deref().or_else(|| {
+            self.tenants
+                .iter()
+                .find(|tenant| tenant.is_current)
+                .map(|tenant| tenant.id.as_str())
+        })
+    }
+
     fn refresh_filter(&mut self) {
         self.filtered = if self.tenant_mode {
             ranked_tenant_indices(&self.query, &self.tenants)
         } else {
             let mut indices = ranked_indices(&self.query, &self.subscriptions);
-            if let Some(tenant_id) = &self.tenant_scope {
+            if let Some(tenant_id) = self.scoped_tenant_id() {
                 indices.retain(|&index| {
                     self.subscriptions[index]
                         .tenant_id
@@ -589,14 +597,15 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             },
         );
+    let tenant_scope = app.scoped_tenant_id();
     let list_name = if app.tenant_mode {
         "Tenants".to_owned()
-    } else if let Some(id) = &app.tenant_scope {
+    } else if let Some(id) = tenant_scope {
         let label = app
             .tenants
             .iter()
             .find(|tenant| tenant.id.trim().eq_ignore_ascii_case(id.trim()))
-            .map_or_else(|| id.clone(), Tenant::label);
+            .map_or_else(|| id.to_owned(), Tenant::label);
         format!("Subscriptions in {label}")
     } else {
         "Subscriptions".to_owned()
@@ -633,7 +642,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.subscriptions
                     .iter()
                     .filter(|subscription| {
-                        app.tenant_scope.as_ref().is_none_or(|id| {
+                        tenant_scope.is_none_or(|id| {
                             subscription
                                 .tenant_id
                                 .trim()
@@ -977,6 +986,64 @@ mod tests {
     }
 
     #[test]
+    fn subscription_picker_defaults_to_the_live_context_tenant() {
+        let cached: Vec<Subscription> = serde_json::from_str(
+            r#"[{"id":"a","name":"Alpha","tenantId":"tenant-a","isDefault":true},
+                {"id":"b","name":"Beta","tenantId":"tenant-b"},
+                {"id":"c","name":"Gamma","tenantId":" TENANT-B "}]"#,
+        )
+        .unwrap();
+        let mut descriptions = serde_json::from_str(
+            r#"[{"tenantId":"tenant-a","displayName":"Tenant A"},
+                {"tenantId":"tenant-b"}]"#,
+        )
+        .unwrap();
+        let metadata: Vec<TenantDescription> = serde_json::from_str(
+            r#"[{"tenantId":"tenant-b","displayName":"Tenant B"},
+                {"tenantId":"tenant-b","defaultDomain":"b.example"}]"#,
+        )
+        .unwrap();
+        AzureCli::merge_tenant_metadata(&mut descriptions, &metadata);
+        let mut live = cached.clone();
+        live[0].is_default = false;
+        live[1].is_default = true;
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(LoadedAccounts::Cached(cached, descriptions.clone()))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        assert_eq!(app.filtered, vec![0]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.filtered, vec![0]);
+
+        sender
+            .send(LoadedAccounts::Subscriptions(live.into()))
+            .unwrap();
+        sender.send(LoadedAccounts::Tenants(descriptions)).unwrap();
+        app.receive_accounts(&receiver);
+        assert_eq!(app.filtered, vec![1, 2]);
+        assert!(app.selected().is_none());
+        app.next();
+        assert_eq!(app.selected().unwrap().id, "b");
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        let frame = terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered: String = frame
+            .buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Subscriptions in Tenant B (b.example) · 2 of 2"));
+        assert!(rendered.contains("Beta"));
+        assert!(rendered.contains("Gamma"));
+        assert!(!rendered.contains("Alpha"));
+        app.append_query("Alpha");
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
     fn tenant_labels_use_names_domains_and_secondary_ids_from_json() {
         let subscriptions: Vec<Subscription> = serde_json::from_str(
             r#"[{"id":"a","name":"Alpha","tenantId":"tenant-a"},
@@ -1056,7 +1123,8 @@ mod tests {
         assert!(app.tenant_mode);
         assert_eq!(app.filtered.len(), 2);
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.filtered.len(), 3);
+        assert_eq!(app.filtered.len(), 2);
+        assert_eq!(app.selected().unwrap().tenant_id.trim(), "other-tenant");
     }
 
     #[test]
