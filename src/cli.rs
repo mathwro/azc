@@ -146,10 +146,13 @@ MATCHING AND RECOVERY:
     A tenant shortlist switches via its current/first subscription on Enter.
 
 TENANT PICKER:
+    Without a query, subscriptions default to the active Azure CLI tenant.
     Show display name (domain), or domain when the name is missing or a GUID.
-    In the full picker, Enter opens that tenant's subscriptions; only
-    subscription Enter changes context. Ctrl+T returns to tenants, then
-    toggles back to all subscriptions. Esc / Ctrl+C cancel without switching.
+    Tenant IDs appear on a second line. In the full picker, Enter opens that
+    tenant's subscriptions; only subscription Enter changes context.
+    Ctrl+T returns to tenants, then back to the scoped subscriptions.
+    Esc / Ctrl+C cancel without switching.
+    Direct-query recovery keeps cross-tenant choices until a tenant is opened.
 
 INTERACTIVE LOADING:
     Show the last picker snapshot (up to seven days old), then update in

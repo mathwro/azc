@@ -121,7 +121,13 @@ class ContextSwitching(unittest.TestCase):
         self.session(['payments'], b'\r', 'dev-id')
 
     def test_ordinary_picker_switches_exact_id(self):
-        self.session([], b'payments production\r', 'prod-id', b'prod-id')
+        self.session([], b'payments development\r', 'dev-id', b'dev-id')
+
+    def test_ordinary_picker_cannot_select_another_tenants_subscription(self):
+        self.session([], b'payments production\r\x03', marker=b'dev-id')
+
+    def test_subscription_shortlist_keeps_cross_tenant_choices(self):
+        self.session(['payments'], b'\x1b[B\r', 'prod-id')
 
     def test_shortlist_ignores_refresh_and_tenant_toggle(self):
         self.session(['payments'], b'\x14\x12\r', 'dev-id')
