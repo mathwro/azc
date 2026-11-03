@@ -28,6 +28,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build host binary
         run: cargo build --locked
+      - name: Test context switching in a real PTY
+        run: python3 scripts/test_context_switching.py
       - name: Smoke-test immutable commands
         shell: bash
         run: |

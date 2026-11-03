@@ -6,12 +6,23 @@ use crate::model::{Subscription, Tenant};
 pub struct MatchScore(u8);
 
 pub fn ranked_indices(query: &str, subscriptions: &[Subscription]) -> Vec<usize> {
+    subscription_matches(query, subscriptions)
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect()
+}
+
+fn subscription_matches(
+    query: &str,
+    subscriptions: &[Subscription],
+) -> Vec<(usize, MatchScore, String, bool)> {
     let query = query.trim().to_lowercase();
+    let fragments = name_fragments(&query);
     let mut matches = subscriptions
         .iter()
         .enumerate()
         .filter_map(|(index, subscription)| {
-            score(&query, subscription).map(|score| {
+            score(&query, &fragments, subscription).map(|score| {
                 (
                     index,
                     score,
@@ -30,16 +41,24 @@ pub fn ranked_indices(query: &str, subscriptions: &[Subscription]) -> Vec<usize>
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    matches.into_iter().map(|entry| entry.0).collect()
+    matches
 }
 
 pub fn ranked_tenant_indices(query: &str, tenants: &[Tenant]) -> Vec<usize> {
+    tenant_matches(query, tenants)
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect()
+}
+
+fn tenant_matches(query: &str, tenants: &[Tenant]) -> Vec<(usize, MatchScore, String, bool)> {
     let query = query.trim().to_lowercase();
+    let fragments = name_fragments(&query);
     let mut matches = tenants
         .iter()
         .enumerate()
         .filter_map(|(index, tenant)| {
-            score_tenant(&query, tenant)
+            score_tenant(&query, &fragments, tenant)
                 .map(|score| (index, score, tenant.name.to_lowercase(), tenant.is_current))
         })
         .collect::<Vec<_>>();
@@ -52,7 +71,7 @@ pub fn ranked_tenant_indices(query: &str, tenants: &[Tenant]) -> Vec<usize> {
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    matches.into_iter().map(|entry| entry.0).collect()
+    matches
 }
 
 pub fn unique_tenant_match<'a>(
@@ -60,34 +79,26 @@ pub fn unique_tenant_match<'a>(
     tenants: &'a [Tenant],
 ) -> Result<&'a Tenant, TenantMatchError> {
     let query = query.trim();
-    let normalized_query = query.to_lowercase();
-    let indices = ranked_tenant_indices(query, tenants);
-    let Some(&first_index) = indices.first() else {
+    let matches = tenant_matches(query, tenants);
+    let Some(&(first_index, best_score, _, _)) = matches.first() else {
         return Err(TenantMatchError::NotFound(query.to_owned()));
     };
 
-    let best_score = score_tenant(&normalized_query, &tenants[first_index])
-        .expect("ranked entries always have a score");
-    let tied = indices
-        .iter()
-        .copied()
-        .take_while(|&index| score_tenant(&normalized_query, &tenants[index]) == Some(best_score))
-        .collect::<Vec<_>>();
-
-    if tied.len() == 1 {
+    if matches.get(1).is_none_or(|entry| entry.1 != best_score) {
         return Ok(&tenants[first_index]);
     }
 
     Err(TenantMatchError::Ambiguous {
         query: query.to_owned(),
-        candidates: tied
+        candidates: matches
             .into_iter()
-            .map(|index| tenants[index].id.clone())
+            .take_while(|entry| entry.1 == best_score)
+            .map(|(index, _, _, _)| (index, tenants[index].id.clone()))
             .collect(),
     })
 }
 
-fn score_tenant(query: &str, tenant: &Tenant) -> Option<MatchScore> {
+fn score_tenant(query: &str, fragments: &[&str], tenant: &Tenant) -> Option<MatchScore> {
     if query.is_empty() {
         return Some(if tenant.is_current {
             MatchScore(0)
@@ -105,6 +116,8 @@ fn score_tenant(query: &str, tenant: &Tenant) -> Option<MatchScore> {
         Some(MatchScore(1))
     } else if name.contains(query) || domain.contains(query) || id.contains(query) {
         Some(MatchScore(2))
+    } else if !fragments.is_empty() && fragments.iter().all(|fragment| name.contains(*fragment)) {
+        Some(MatchScore(3))
     } else {
         None
     }
@@ -115,7 +128,7 @@ pub enum TenantMatchError {
     NotFound(String),
     Ambiguous {
         query: String,
-        candidates: Vec<String>,
+        candidates: Vec<(usize, String)>,
     },
 }
 
@@ -124,11 +137,14 @@ impl fmt::Display for TenantMatchError {
         match self {
             Self::NotFound(query) => write!(f, "no tenant matches '{query}'"),
             Self::Ambiguous { query, candidates } => {
-                write!(
-                    f,
-                    "'{query}' is ambiguous; matches: {}",
-                    candidates.join(", ")
-                )
+                write!(f, "'{query}' is ambiguous; matches: ")?;
+                for (position, (_, label)) in candidates.iter().enumerate() {
+                    if position != 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(label)?;
+                }
+                Ok(())
             }
         }
     }
@@ -141,34 +157,39 @@ pub fn unique_match<'a>(
     subscriptions: &'a [Subscription],
 ) -> Result<&'a Subscription, MatchError> {
     let query = query.trim();
-    let normalized_query = query.to_lowercase();
-    let indices = ranked_indices(query, subscriptions);
-    let Some(&first_index) = indices.first() else {
+    let matches = subscription_matches(query, subscriptions);
+    let Some(&(first_index, best_score, _, _)) = matches.first() else {
         return Err(MatchError::NotFound(query.to_owned()));
     };
 
-    let best_score = score(&normalized_query, &subscriptions[first_index])
-        .expect("ranked entries always have a score");
-    let tied = indices
-        .iter()
-        .copied()
-        .take_while(|&index| score(&normalized_query, &subscriptions[index]) == Some(best_score))
-        .collect::<Vec<_>>();
-
-    if tied.len() == 1 {
+    if matches.get(1).is_none_or(|entry| entry.1 != best_score) {
         return Ok(&subscriptions[first_index]);
     }
 
     Err(MatchError::Ambiguous {
         query: query.to_owned(),
-        candidates: tied
+        candidates: matches
             .into_iter()
-            .map(|index| subscriptions[index].name.clone())
+            .take_while(|entry| entry.1 == best_score)
+            .map(|(index, _, _, _)| (index, subscriptions[index].name.clone()))
             .collect(),
     })
 }
 
-fn score(query: &str, subscription: &Subscription) -> Option<MatchScore> {
+fn name_fragments(query: &str) -> Vec<&str> {
+    let mut fragments = query.split_whitespace();
+    let Some(first) = fragments.next() else {
+        return Vec::new();
+    };
+    let Some(second) = fragments.next() else {
+        return Vec::new();
+    };
+    let mut terms = vec![first, second];
+    terms.extend(fragments);
+    terms
+}
+
+fn score(query: &str, fragments: &[&str], subscription: &Subscription) -> Option<MatchScore> {
     if query.is_empty() {
         return Some(if subscription.is_default {
             MatchScore(0)
@@ -194,6 +215,8 @@ fn score(query: &str, subscription: &Subscription) -> Option<MatchScore> {
         Some(MatchScore(3))
     } else if id.contains(query) || tenant_id.contains(query) {
         Some(MatchScore(4))
+    } else if !fragments.is_empty() && fragments.iter().all(|fragment| name.contains(*fragment)) {
+        Some(MatchScore(5))
     } else {
         None
     }
@@ -204,7 +227,7 @@ pub enum MatchError {
     NotFound(String),
     Ambiguous {
         query: String,
-        candidates: Vec<String>,
+        candidates: Vec<(usize, String)>,
     },
 }
 
@@ -213,11 +236,14 @@ impl fmt::Display for MatchError {
         match self {
             Self::NotFound(query) => write!(f, "no subscription matches '{query}'"),
             Self::Ambiguous { query, candidates } => {
-                write!(
-                    f,
-                    "'{query}' is ambiguous; matches: {}",
-                    candidates.join(", ")
-                )
+                write!(f, "'{query}' is ambiguous; matches: ")?;
+                for (position, (_, label)) in candidates.iter().enumerate() {
+                    if position != 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(label)?;
+                }
+                Ok(())
             }
         }
     }
@@ -264,6 +290,23 @@ mod tests {
     }
 
     #[test]
+    fn separated_fragments_require_every_term_and_rank_after_contiguous_matches() {
+        let subscriptions = vec![
+            subscription("prod-platform-payments", "1", false),
+            subscription("payments-dev", "2", false),
+            subscription("payments prod", "3", false),
+            subscription("payments-platform-prod", "4", true),
+        ];
+        assert_eq!(ranked_indices("PAYMENTS prod", &subscriptions), [2, 3, 0]);
+        assert_eq!(ranked_indices("prod\tpayments", &subscriptions), [3, 2, 0]);
+        assert!(ranked_indices("payments missing", &subscriptions).is_empty());
+        assert_eq!(
+            unique_match("payments prod", &subscriptions).unwrap().id,
+            "3"
+        );
+    }
+
+    #[test]
     fn empty_query_puts_current_subscription_first() {
         let subscriptions = vec![
             subscription("Alpha", "1", false),
@@ -294,7 +337,10 @@ mod tests {
             unique_match("hr", &subscriptions),
             Err(MatchError::Ambiguous {
                 query: "hr".to_owned(),
-                candidates: vec!["HR Development".to_owned(), "HR Production".to_owned()],
+                candidates: vec![
+                    (1, "HR Development".to_owned()),
+                    (0, "HR Production".to_owned())
+                ],
             })
         );
     }
@@ -374,7 +420,130 @@ mod tests {
             unique_tenant_match("aaaa", &tenants),
             Err(TenantMatchError::Ambiguous {
                 query: "aaaa".to_owned(),
-                candidates: vec!["aaaa-one".to_owned(), "aaaa-two".to_owned()],
+                candidates: vec![(0, "aaaa-one".to_owned()), (1, "aaaa-two".to_owned())],
+            })
+        );
+    }
+
+    #[test]
+    fn fragment_ambiguity_preserves_source_indices_for_duplicate_names() {
+        let subscriptions = vec![
+            subscription("payments-platform-prod", "1", false),
+            subscription("payments-dev", "2", false),
+            subscription("payments-platform-prod", "3", true),
+        ];
+
+        assert_eq!(
+            unique_match("prod payments", &subscriptions),
+            Err(MatchError::Ambiguous {
+                query: "prod payments".to_owned(),
+                candidates: vec![
+                    (2, "payments-platform-prod".to_owned()),
+                    (0, "payments-platform-prod".to_owned()),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn ambiguity_candidates_exclude_lower_contiguous_and_fragment_matches() {
+        let subscriptions = vec![
+            subscription("North payments prod", "1", true),
+            subscription("payments prod B", "2", false),
+            subscription("payments-platform-prod", "3", false),
+            subscription("payments prod A", "4", false),
+        ];
+
+        assert_eq!(
+            unique_match("payments prod", &subscriptions),
+            Err(MatchError::Ambiguous {
+                query: "payments prod".to_owned(),
+                candidates: vec![
+                    (3, "payments prod A".to_owned()),
+                    (1, "payments prod B".to_owned()),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn fragments_do_not_expand_id_matching_or_allow_skipped_letters() {
+        let subscriptions = vec![
+            subscription("payments-platform-prod", "1", true),
+            subscription("Unrelated", "id-payments prod-end", false),
+            subscription("Other", "prod-payments", false),
+        ];
+
+        assert_eq!(ranked_indices("payments prod", &subscriptions), [1, 0]);
+        assert_eq!(
+            unique_match("payments prod", &subscriptions).unwrap().id,
+            "id-payments prod-end"
+        );
+        assert!(ranked_indices("tenant one", &subscriptions).is_empty());
+        assert!(ranked_indices("pymnts prd", &subscriptions).is_empty());
+        assert_eq!(ranked_indices("tenant-one", &subscriptions), [0, 2, 1]);
+    }
+
+    fn tenant(name: &str, id: &str, domain: &str) -> Tenant {
+        Tenant {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            default_domain: domain.to_owned(),
+            subscription_index: 0,
+            subscription_count: 1,
+            is_current: false,
+        }
+    }
+
+    #[test]
+    fn tenant_name_fragments_rank_after_contiguous_matches_in_every_field() {
+        let tenants = vec![
+            tenant("payments-platform-prod", "1", ""),
+            tenant("Other", "2", "prefix-payments prod-suffix"),
+            tenant("payments prod", "3", ""),
+            tenant("Unrelated", "prefix-payments prod-suffix", ""),
+        ];
+
+        assert_eq!(
+            ranked_tenant_indices("PAYMENTS prod", &tenants),
+            [2, 1, 3, 0]
+        );
+        assert_eq!(
+            unique_tenant_match("payments prod", &tenants).unwrap().id,
+            "3"
+        );
+        assert_eq!(ranked_tenant_indices("prod\tpayments", &tenants), [2, 0]);
+        assert!(ranked_tenant_indices("payments missing", &tenants).is_empty());
+        assert!(ranked_tenant_indices("pymnts prd", &tenants).is_empty());
+        assert_eq!(ranked_tenant_indices("prefix-", &tenants), [1, 3]);
+    }
+
+    #[test]
+    fn tenant_ambiguity_indices_exclude_lower_matches_and_use_tenant_order() {
+        let tenants = vec![
+            tenant("payments-platform-prod", "fragment", ""),
+            tenant("payments prod", "second", ""),
+            tenant("North payments prod", "substring", ""),
+            tenant("payments prod", "first", ""),
+        ];
+
+        assert_eq!(
+            unique_tenant_match("payments prod", &tenants),
+            Err(TenantMatchError::Ambiguous {
+                query: "payments prod".to_owned(),
+                candidates: vec![(1, "second".to_owned()), (3, "first".to_owned())],
+            })
+        );
+        assert_eq!(
+            unique_tenant_match("prod payments", &tenants),
+            Err(TenantMatchError::Ambiguous {
+                query: "prod payments".to_owned(),
+                candidates: vec![
+                    (2, "substring".to_owned()),
+                    (1, "second".to_owned()),
+                    (3, "first".to_owned()),
+                    (0, "fragment".to_owned()),
+                ],
             })
         );
     }
