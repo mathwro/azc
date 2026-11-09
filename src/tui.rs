@@ -877,7 +877,6 @@ mod tests {
                 name: name.to_owned(),
                 tenant_id: "tenant".to_owned(),
                 is_default: index == 0,
-                state: "Enabled".to_owned(),
             })
             .collect()
     }
@@ -950,7 +949,6 @@ mod tests {
             name: "Archive HR".to_owned(),
             tenant_id: "tenant".to_owned(),
             is_default: false,
-            state: "Enabled".to_owned(),
         });
         let mut app = App::from_query(
             subscriptions,
