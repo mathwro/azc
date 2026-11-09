@@ -16,8 +16,8 @@ use std::{
 
 use azure::{AzureCli, AzureError};
 use cli::Command;
-use matcher::{MatchError, TenantMatchError, unique_match, unique_tenant_match};
-use model::{Subscription, tenants_from_subscriptions};
+use matcher::{MatchError, unique_match, unique_tenant_match};
+use model::{Subscription, TenantDescription, tenants_from_subscriptions};
 
 fn main() -> ExitCode {
     match run() {
@@ -62,23 +62,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             let subscription = match unique_match(&query, &subscriptions) {
                 Ok(subscription) => subscription,
                 Err(error) => {
-                    if !can_open_picker() {
-                        return Err(error.into());
-                    }
-                    let shortlist = match error {
-                        MatchError::NotFound(_) => None,
-                        MatchError::Ambiguous { candidates, .. } => {
-                            Some(candidates.into_iter().map(|(index, _)| index).collect())
-                        }
-                    };
-                    let Some(subscription) = tui::choose_from_query(
-                        azure.clone(),
-                        subscriptions,
-                        None,
-                        query,
-                        false,
-                        shortlist,
-                    )?
+                    let Some(subscription) =
+                        recover_in_picker(&azure, error, subscriptions, None, query, false)?
                     else {
                         return Ok(());
                     };
@@ -103,22 +88,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 match unique_tenant_match(&query, &tenants) {
                     Ok(tenant) => subscriptions[tenant.subscription_index].clone(),
                     Err(error) => {
-                        if !can_open_picker() {
-                            return Err(error.into());
-                        }
-                        let shortlist = match error {
-                            TenantMatchError::NotFound(_) => None,
-                            TenantMatchError::Ambiguous { candidates, .. } => {
-                                Some(candidates.into_iter().map(|(index, _)| index).collect())
-                            }
-                        };
-                        let Some(subscription) = tui::choose_from_query(
-                            azure.clone(),
+                        let Some(subscription) = recover_in_picker(
+                            &azure,
+                            error,
                             subscriptions,
                             Some(descriptions),
                             query,
                             true,
-                            shortlist,
                         )?
                         else {
                             return Ok(());
@@ -147,6 +123,35 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn can_open_picker() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// Opens the picker for a direct query without a unique match, or returns the
+/// match error when no terminal is available.
+fn recover_in_picker(
+    azure: &AzureCli,
+    error: MatchError,
+    subscriptions: Vec<Subscription>,
+    descriptions: Option<Vec<TenantDescription>>,
+    query: String,
+    tenant_mode: bool,
+) -> Result<Option<Subscription>, Box<dyn Error>> {
+    if !can_open_picker() {
+        return Err(error.into());
+    }
+    let shortlist = match error {
+        MatchError::NotFound { .. } => None,
+        MatchError::Ambiguous { candidates, .. } => {
+            Some(candidates.into_iter().map(|(index, _)| index).collect())
+        }
+    };
+    tui::choose_from_query(
+        azure.clone(),
+        subscriptions,
+        descriptions,
+        query,
+        tenant_mode,
+        shortlist,
+    )
 }
 
 fn switch_subscription(
