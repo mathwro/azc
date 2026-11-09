@@ -5,95 +5,118 @@ use crate::model::{Subscription, Tenant};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct MatchScore(u8);
 
-pub fn ranked_indices(query: &str, subscriptions: &[Subscription]) -> Vec<usize> {
-    subscription_matches(query, subscriptions)
-        .into_iter()
-        .map(|entry| entry.0)
-        .collect()
+/// A rankable item; ranking and unique selection are shared across item kinds.
+trait Candidate {
+    /// Noun used in "no <kind> matches" errors.
+    const KIND: &'static str;
+    const SCORE: fn(&str, &[&str], &Self) -> Option<MatchScore>;
+
+    /// Display name and current flag used to break score ties.
+    fn tie_break(&self) -> (&str, bool);
+    /// Label listed in ambiguity errors.
+    fn describe(&self) -> String;
 }
 
-fn subscription_matches(
-    query: &str,
-    subscriptions: &[Subscription],
-) -> Vec<(usize, MatchScore, String, bool)> {
-    let query = query.trim().to_lowercase();
-    let fragments = name_fragments(&query);
-    let mut matches = subscriptions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, subscription)| {
-            score(&query, &fragments, subscription).map(|score| {
-                (
-                    index,
-                    score,
-                    subscription.name.to_lowercase(),
-                    subscription.is_default,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
+impl Candidate for Subscription {
+    const KIND: &'static str = "subscription";
+    const SCORE: fn(&str, &[&str], &Self) -> Option<MatchScore> = score;
 
-    matches.sort_by(|left, right| {
-        left.1
-            .cmp(&right.1)
-            .then_with(|| right.3.cmp(&left.3))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.0.cmp(&right.0))
-    });
+    fn tie_break(&self) -> (&str, bool) {
+        (&self.name, self.is_default)
+    }
 
-    matches
+    fn describe(&self) -> String {
+        self.name.clone()
+    }
+}
+
+impl Candidate for Tenant {
+    const KIND: &'static str = "tenant";
+    const SCORE: fn(&str, &[&str], &Self) -> Option<MatchScore> = score_tenant;
+
+    fn tie_break(&self) -> (&str, bool) {
+        (&self.name, self.is_current)
+    }
+
+    fn describe(&self) -> String {
+        let label = self.label();
+        if label == self.id {
+            label
+        } else {
+            format!("{label} ({})", self.id)
+        }
+    }
+}
+
+pub fn ranked_indices(query: &str, subscriptions: &[Subscription]) -> Vec<usize> {
+    ranked(query, subscriptions)
 }
 
 pub fn ranked_tenant_indices(query: &str, tenants: &[Tenant]) -> Vec<usize> {
-    tenant_matches(query, tenants)
-        .into_iter()
-        .map(|entry| entry.0)
-        .collect()
+    ranked(query, tenants)
 }
 
-fn tenant_matches(query: &str, tenants: &[Tenant]) -> Vec<(usize, MatchScore, String, bool)> {
-    let query = query.trim().to_lowercase();
-    let fragments = name_fragments(&query);
-    let mut matches = tenants
-        .iter()
-        .enumerate()
-        .filter_map(|(index, tenant)| {
-            score_tenant(&query, &fragments, tenant)
-                .map(|score| (index, score, tenant.name.to_lowercase(), tenant.is_current))
-        })
-        .collect::<Vec<_>>();
-
-    matches.sort_by(|left, right| {
-        left.1
-            .cmp(&right.1)
-            .then_with(|| right.3.cmp(&left.3))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.0.cmp(&right.0))
-    });
-
-    matches
+pub fn unique_match<'a>(
+    query: &str,
+    subscriptions: &'a [Subscription],
+) -> Result<&'a Subscription, MatchError> {
+    unique(query, subscriptions)
 }
 
 pub fn unique_tenant_match<'a>(
     query: &str,
     tenants: &'a [Tenant],
-) -> Result<&'a Tenant, TenantMatchError> {
+) -> Result<&'a Tenant, MatchError> {
+    unique(query, tenants)
+}
+
+fn ranked<T: Candidate>(query: &str, items: &[T]) -> Vec<usize> {
+    matches(query, items)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Orders matches by score, current item first, case-insensitive name, then source order.
+fn matches<T: Candidate>(query: &str, items: &[T]) -> Vec<(usize, MatchScore)> {
+    let query = query.trim().to_lowercase();
+    let fragments = name_fragments(&query);
+    let mut matches = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let score = T::SCORE(&query, &fragments, item)?;
+            let (name, is_current) = item.tie_break();
+            Some((score, !is_current, name.to_lowercase(), index))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches
+        .into_iter()
+        .map(|(score, _, _, index)| (index, score))
+        .collect()
+}
+
+fn unique<'a, T: Candidate>(query: &str, items: &'a [T]) -> Result<&'a T, MatchError> {
     let query = query.trim();
-    let matches = tenant_matches(query, tenants);
-    let Some(&(first_index, best_score, _, _)) = matches.first() else {
-        return Err(TenantMatchError::NotFound(query.to_owned()));
+    let matches = matches(query, items);
+    let Some(&(first_index, best_score)) = matches.first() else {
+        return Err(MatchError::NotFound {
+            kind: T::KIND,
+            query: query.to_owned(),
+        });
     };
 
     if matches.get(1).is_none_or(|entry| entry.1 != best_score) {
-        return Ok(&tenants[first_index]);
+        return Ok(&items[first_index]);
     }
 
-    Err(TenantMatchError::Ambiguous {
+    Err(MatchError::Ambiguous {
         query: query.to_owned(),
         candidates: matches
             .into_iter()
             .take_while(|entry| entry.1 == best_score)
-            .map(|(index, _, _, _)| (index, tenants[index].id.clone()))
+            .map(|(index, _)| (index, items[index].describe()))
             .collect(),
     })
 }
@@ -121,59 +144,6 @@ fn score_tenant(query: &str, fragments: &[&str], tenant: &Tenant) -> Option<Matc
     } else {
         None
     }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum TenantMatchError {
-    NotFound(String),
-    Ambiguous {
-        query: String,
-        candidates: Vec<(usize, String)>,
-    },
-}
-
-impl fmt::Display for TenantMatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(query) => write!(f, "no tenant matches '{query}'"),
-            Self::Ambiguous { query, candidates } => {
-                write!(f, "'{query}' is ambiguous; matches: ")?;
-                for (position, (_, label)) in candidates.iter().enumerate() {
-                    if position != 0 {
-                        f.write_str(", ")?;
-                    }
-                    f.write_str(label)?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl Error for TenantMatchError {}
-
-pub fn unique_match<'a>(
-    query: &str,
-    subscriptions: &'a [Subscription],
-) -> Result<&'a Subscription, MatchError> {
-    let query = query.trim();
-    let matches = subscription_matches(query, subscriptions);
-    let Some(&(first_index, best_score, _, _)) = matches.first() else {
-        return Err(MatchError::NotFound(query.to_owned()));
-    };
-
-    if matches.get(1).is_none_or(|entry| entry.1 != best_score) {
-        return Ok(&subscriptions[first_index]);
-    }
-
-    Err(MatchError::Ambiguous {
-        query: query.to_owned(),
-        candidates: matches
-            .into_iter()
-            .take_while(|entry| entry.1 == best_score)
-            .map(|(index, _, _, _)| (index, subscriptions[index].name.clone()))
-            .collect(),
-    })
 }
 
 fn name_fragments(query: &str) -> Vec<&str> {
@@ -224,7 +194,10 @@ fn score(query: &str, fragments: &[&str], subscription: &Subscription) -> Option
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum MatchError {
-    NotFound(String),
+    NotFound {
+        kind: &'static str,
+        query: String,
+    },
     Ambiguous {
         query: String,
         candidates: Vec<(usize, String)>,
@@ -234,7 +207,7 @@ pub enum MatchError {
 impl fmt::Display for MatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotFound(query) => write!(f, "no subscription matches '{query}'"),
+            Self::NotFound { kind, query } => write!(f, "no {kind} matches '{query}'"),
             Self::Ambiguous { query, candidates } => {
                 write!(f, "'{query}' is ambiguous; matches: ")?;
                 for (position, (_, label)) in candidates.iter().enumerate() {
@@ -254,8 +227,7 @@ impl Error for MatchError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MatchError, TenantMatchError, ranked_indices, ranked_tenant_indices, unique_match,
-        unique_tenant_match,
+        MatchError, ranked_indices, ranked_tenant_indices, unique_match, unique_tenant_match,
     };
     use crate::model::{Subscription, Tenant};
 
@@ -418,9 +390,12 @@ mod tests {
 
         assert_eq!(
             unique_tenant_match("aaaa", &tenants),
-            Err(TenantMatchError::Ambiguous {
+            Err(MatchError::Ambiguous {
                 query: "aaaa".to_owned(),
-                candidates: vec![(0, "aaaa-one".to_owned()), (1, "aaaa-two".to_owned())],
+                candidates: vec![
+                    (0, "Tenant One (aaaa-one)".to_owned()),
+                    (1, "Tenant Two (aaaa-two)".to_owned())
+                ],
             })
         );
     }
@@ -529,22 +504,54 @@ mod tests {
 
         assert_eq!(
             unique_tenant_match("payments prod", &tenants),
-            Err(TenantMatchError::Ambiguous {
+            Err(MatchError::Ambiguous {
                 query: "payments prod".to_owned(),
-                candidates: vec![(1, "second".to_owned()), (3, "first".to_owned())],
+                candidates: vec![
+                    (1, "payments prod (second)".to_owned()),
+                    (3, "payments prod (first)".to_owned())
+                ],
             })
         );
         assert_eq!(
             unique_tenant_match("prod payments", &tenants),
-            Err(TenantMatchError::Ambiguous {
+            Err(MatchError::Ambiguous {
                 query: "prod payments".to_owned(),
                 candidates: vec![
-                    (2, "substring".to_owned()),
-                    (1, "second".to_owned()),
-                    (3, "first".to_owned()),
-                    (0, "fragment".to_owned()),
+                    (2, "North payments prod (substring)".to_owned()),
+                    (1, "payments prod (second)".to_owned()),
+                    (3, "payments prod (first)".to_owned()),
+                    (0, "payments-platform-prod (fragment)".to_owned()),
                 ],
             })
+        );
+    }
+
+    #[test]
+    fn errors_name_the_item_kind_and_label_ambiguous_tenants_with_ids() {
+        let tenants = vec![
+            tenant("North Europe", "1b2c", "north.example"),
+            tenant("North America", "9f8e", ""),
+            tenant("", "north-id", ""),
+        ];
+
+        assert_eq!(
+            unique_tenant_match("north", &tenants)
+                .unwrap_err()
+                .to_string(),
+            "'north' is ambiguous; matches: north-id, North America (9f8e), \
+             North Europe (north.example) (1b2c)"
+        );
+        assert_eq!(
+            unique_tenant_match("south", &tenants)
+                .unwrap_err()
+                .to_string(),
+            "no tenant matches 'south'"
+        );
+        assert_eq!(
+            unique_match("south", &[subscription("North", "1", false)])
+                .unwrap_err()
+                .to_string(),
+            "no subscription matches 'south'"
         );
     }
 }
