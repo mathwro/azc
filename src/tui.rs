@@ -135,16 +135,18 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
         return false;
     }
     let cache = Cache::from_env();
-    if !refresh
-        && let Some(snapshot) = cache.as_ref().and_then(Cache::load)
-        && sender
+    let mut previous_descriptions = Vec::new();
+    if !refresh && let Some(snapshot) = cache.as_ref().and_then(Cache::load) {
+        previous_descriptions.clone_from(&snapshot.descriptions);
+        if sender
             .send(LoadedAccounts::Cached(
                 snapshot.subscriptions,
                 snapshot.descriptions,
             ))
             .is_err()
-    {
-        return false;
+        {
+            return false;
+        }
     }
     let subscriptions: Arc<Vec<Subscription>> = match azure.list_subscriptions(refresh) {
         Ok(subscriptions) => subscriptions.into(),
@@ -154,9 +156,10 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
                 .is_ok();
         }
     };
-    // Save and publish subscriptions before waiting for tenant metadata.
+    // Save and publish subscriptions before waiting for tenant metadata, keeping
+    // previous tenant labels in case the user switches before metadata arrives.
     if let Some(cache) = &cache {
-        let _ = cache.save(&subscriptions, &[]);
+        let _ = cache.save(&subscriptions, &previous_descriptions);
     }
     if sender
         .send(LoadedAccounts::Subscriptions(Arc::clone(&subscriptions)))
@@ -388,6 +391,19 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         // Any key other than Enter abandons a deferred switch.
         self.pending_switch = None;
+        // Windows reports AltGr as Ctrl+Alt with the produced character, and
+        // that cannot be told apart from a literal Ctrl+Alt chord, so keep it
+        // searchable rather than treating it as an Alt or Ctrl shortcut.
+        if let KeyCode::Char(character) = key.code
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !character.is_control()
+        {
+            self.query.push(character);
+            self.refresh_filter();
+            return None;
+        }
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('j') => {
@@ -643,6 +659,22 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn current_tenant_label(app: &App) -> String {
+    app.tenants
+        .iter()
+        .find(|tenant| tenant.is_current)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |tenant| {
+                if tenant.name.is_empty() {
+                    tenant.id.clone()
+                } else {
+                    format!("{} ({})", tenant.name, tenant.id)
+                }
+            },
+        )
+}
+
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let items = if app.tenant_mode {
         app.filtered
@@ -709,20 +741,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect::<Vec<_>>()
     };
 
-    let current_tenant = app
-        .tenants
-        .iter()
-        .find(|tenant| tenant.is_current)
-        .map_or_else(
-            || "unknown".to_owned(),
-            |tenant| {
-                if tenant.name.is_empty() {
-                    tenant.id.clone()
-                } else {
-                    format!("{} ({})", tenant.name, tenant.id)
-                }
-            },
-        );
+    let current_tenant = current_tenant_label(app);
     let tenant_scope = app.scoped_tenant_id();
     let list_name = if app.tenant_mode {
         "Tenants".to_owned()
@@ -845,20 +864,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let current_tenant = app
-        .tenants
-        .iter()
-        .find(|tenant| tenant.is_current)
-        .map_or_else(
-            || "unknown".to_owned(),
-            |tenant| {
-                if tenant.name.is_empty() {
-                    tenant.id.clone()
-                } else {
-                    format!("{} ({})", tenant.name, tenant.id)
-                }
-            },
-        );
+    let current_tenant = current_tenant_label(app);
     let status = if app.selected().is_some() {
         format!(
             " Enter {} · Ctrl+R refresh · Ctrl+T {} · Esc cancel · current tenant {} ",
@@ -927,7 +933,6 @@ mod tests {
                 name: name.to_owned(),
                 tenant_id: "tenant".to_owned(),
                 is_default: index == 0,
-                state: "Enabled".to_owned(),
             })
             .collect()
     }
@@ -1000,7 +1005,6 @@ mod tests {
             name: "Archive HR".to_owned(),
             tenant_id: "tenant".to_owned(),
             is_default: false,
-            state: "Enabled".to_owned(),
         });
         let mut app = App::from_query(
             subscriptions,
@@ -1495,6 +1499,27 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.query, "j");
+    }
+
+    #[test]
+    fn altgr_characters_reported_as_ctrl_alt_become_search_text() {
+        let mut app = loaded_app();
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+        for character in ['ł', '@', 'j'] {
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), altgr)),
+                None
+            );
+        }
+        assert_eq!(app.query, "ł@j");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.query, "");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Cancel)
+        );
     }
 
     #[test]

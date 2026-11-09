@@ -3,7 +3,7 @@ use std::{
     error::Error,
     ffi::OsString,
     fmt, io,
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
 };
 
 use serde::de::DeserializeOwned;
@@ -49,10 +49,6 @@ impl AzureCli {
             "json",
         ]);
 
-        let output = self.run(command, "az rest tenant list")?;
-        let mut descriptions: Vec<TenantDescription> =
-            parse_json(&output.stdout).map_err(AzureError::InvalidTenantJson)?;
-
         let mut metadata_command = self.command();
         metadata_command.args([
             "account",
@@ -64,13 +60,39 @@ impl AzureCli {
             "json",
             "--only-show-errors",
         ]);
-        let metadata_output = self.run(metadata_command, "az account list tenant metadata")?;
-        let metadata: Vec<TenantDescription> =
-            parse_json(&metadata_output.stdout).map_err(AzureError::InvalidTenantMetadataJson)?;
 
-        Self::merge_tenant_metadata(&mut descriptions, &metadata);
+        // Start both before collecting either so their Azure CLI startups overlap.
+        // A child that fills its pipe while the other is collected just waits.
+        let rest = self.spawn(command, "az rest tenant list");
+        let metadata = self.spawn(metadata_command, "az account list tenant metadata");
+        let rest = rest
+            .and_then(|child| self.collect(child, "az rest tenant list"))
+            .and_then(|output| {
+                parse_json::<Vec<TenantDescription>>(&output.stdout)
+                    .map_err(AzureError::InvalidTenantJson)
+            });
+        let metadata = metadata
+            .and_then(|child| self.collect(child, "az account list tenant metadata"))
+            .and_then(|output| {
+                parse_json::<Vec<TenantDescription>>(&output.stdout)
+                    .map_err(AzureError::InvalidTenantMetadataJson)
+            });
 
-        Ok(descriptions)
+        // Either source alone still yields labels: the local metadata covers
+        // offline use and tenants whose Resource Manager access needs sign-in.
+        match (rest, metadata) {
+            (Ok(mut descriptions), Ok(metadata)) => {
+                Self::merge_tenant_metadata(&mut descriptions, &metadata);
+                Ok(descriptions)
+            }
+            (Ok(descriptions), Err(_)) => Ok(descriptions),
+            (Err(_), Ok(metadata)) => {
+                let mut descriptions = Vec::new();
+                Self::merge_tenant_metadata(&mut descriptions, &metadata);
+                Ok(descriptions)
+            }
+            (Err(error), Err(_)) => Err(error),
+        }
     }
 
     pub(crate) fn merge_tenant_metadata(
@@ -152,9 +174,23 @@ impl AzureCli {
         command
     }
 
-    fn run(&self, mut command: Command, operation: &'static str) -> Result<Output, AzureError> {
-        let output = command
-            .output()
+    fn run(&self, command: Command, operation: &'static str) -> Result<Output, AzureError> {
+        self.collect(self.spawn(command, operation)?, operation)
+    }
+
+    /// Starts `command` with the same stdio as `Command::output`.
+    fn spawn(&self, mut command: Command, operation: &'static str) -> Result<Child, AzureError> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| self.start_error(operation, source))
+    }
+
+    fn collect(&self, child: Child, operation: &'static str) -> Result<Output, AzureError> {
+        let output = child
+            .wait_with_output()
             .map_err(|source| self.start_error(operation, source))?;
 
         if output.status.success() {
@@ -505,6 +541,10 @@ mod tests {
         assert_eq!(descriptions[1], metadata[0]);
     }
 
+    // Do not fork another fake while its script is open for writing.
+    #[cfg(unix)]
+    static SCRIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     mod reauthentication {
         use super::super::AzureCli;
@@ -514,7 +554,7 @@ mod tests {
             os::unix::fs::PermissionsExt,
             path::PathBuf,
             sync::{
-                Mutex, MutexGuard,
+                MutexGuard,
                 atomic::{AtomicU64, Ordering},
             },
         };
@@ -526,9 +566,7 @@ mod tests {
 
         impl FakeAzure {
             fn new(mode: &str) -> Self {
-                // Do not fork another fake while its script is open for writing.
-                static SCRIPT_LOCK: Mutex<()> = Mutex::new(());
-                let guard = SCRIPT_LOCK
+                let guard = super::SCRIPT_LOCK
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -673,6 +711,181 @@ esac
                 fs::read_to_string(fake.directory.join("active")).unwrap(),
                 "selected-id"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    mod tenant_loading {
+        use super::super::{AzureCli, AzureError};
+        use crate::model::{Subscription, TenantDescription, tenants_from_subscriptions};
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            path::PathBuf,
+            sync::{
+                MutexGuard,
+                atomic::{AtomicU64, Ordering},
+            },
+        };
+
+        const RESOURCE_MANAGER: &str = r#"[
+            {"tenantId":"tenant-a","displayName":"Contoso","defaultDomain":"contoso.example"},
+            {"tenantId":"tenant-b","displayName":null,"defaultDomain":null}
+        ]"#;
+        // Azure CLI repeats tenant metadata for every subscription record.
+        const LOCAL: &str = r#"[
+            {"tenantId":"TENANT-B","displayName":null,"defaultDomain":null},
+            {"tenantId":"tenant-b","displayName":"Fabrikam","defaultDomain":"fabrikam.example"},
+            {"tenantId":"tenant-a","displayName":"Contoso Local","defaultDomain":"local.example"},
+            {"tenantId":"tenant-c","displayName":"","defaultDomain":"northwind.example"}
+        ]"#;
+
+        struct FakeAzure {
+            directory: PathBuf,
+            _guard: MutexGuard<'static, ()>,
+        }
+
+        impl FakeAzure {
+            /// Each source fails unless its JSON is given. The Resource
+            /// Manager call only answers once the local call has started.
+            fn new(rest: Option<&str>, local: Option<&str>) -> Self {
+                let guard = super::SCRIPT_LOCK
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "azc-tenant-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir(&path).unwrap();
+                if let Some(json) = rest {
+                    fs::write(path.join("rest.json"), json).unwrap();
+                }
+                if let Some(json) = local {
+                    fs::write(path.join("local.json"), json).unwrap();
+                }
+                fs::write(
+                    path.join("az"),
+                    r#"#!/bin/sh
+directory=${0%/*}
+case "$*" in
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
+    attempts=0
+    while [ ! -f "$directory/local-started" ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -gt 100 ]; then
+        echo 'ERROR: tenant commands ran sequentially' >&2
+        exit 3
+      fi
+      sleep 0.05
+    done
+    source=rest
+    ;;
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    touch "$directory/local-started"
+    source=local
+    ;;
+  *) exit 2 ;;
+esac
+if [ -f "$directory/$source.json" ]; then
+  cat "$directory/$source.json"
+else
+  echo "ERROR: $source tenant data unavailable" >&2
+  exit 1
+fi
+"#,
+                )
+                .unwrap();
+                fs::set_permissions(path.join("az"), fs::Permissions::from_mode(0o700)).unwrap();
+                Self {
+                    directory: path,
+                    _guard: guard,
+                }
+            }
+
+            fn list_tenants(&self) -> Result<Vec<TenantDescription>, AzureError> {
+                AzureCli {
+                    executable: self.directory.join("az").into_os_string(),
+                }
+                .list_tenants()
+            }
+        }
+
+        impl Drop for FakeAzure {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        fn labels(descriptions: &[TenantDescription]) -> Vec<String> {
+            let subscriptions: Vec<Subscription> = serde_json::from_str(
+                r#"[
+                    {"id":"sub-1","name":"One","tenantId":"tenant-a"},
+                    {"id":"sub-2","name":"Two","tenantId":"tenant-b","isDefault":true},
+                    {"id":"sub-3","name":"Three","tenantId":"tenant-c"},
+                    {"id":"sub-4","name":"Four","tenantId":"tenant-b"}
+                ]"#,
+            )
+            .unwrap();
+            tenants_from_subscriptions(&subscriptions, descriptions)
+                .iter()
+                .map(|tenant| tenant.label())
+                .collect()
+        }
+
+        #[test]
+        fn resource_manager_names_take_precedence_over_local_metadata() {
+            let fake = FakeAzure::new(Some(RESOURCE_MANAGER), Some(LOCAL));
+            let descriptions = fake.list_tenants().unwrap();
+            assert_eq!(
+                labels(&descriptions),
+                [
+                    "Contoso (contoso.example)",
+                    "Fabrikam (fabrikam.example)",
+                    "northwind.example"
+                ]
+            );
+        }
+
+        #[test]
+        fn local_metadata_names_tenants_when_resource_manager_fails() {
+            let fake = FakeAzure::new(None, Some(LOCAL));
+            let descriptions = fake.list_tenants().unwrap();
+            assert_eq!(descriptions.len(), 3);
+            assert_eq!(
+                labels(&descriptions),
+                [
+                    "Contoso Local (local.example)",
+                    "Fabrikam (fabrikam.example)",
+                    "northwind.example"
+                ]
+            );
+        }
+
+        #[test]
+        fn resource_manager_names_survive_local_metadata_failure() {
+            let fake = FakeAzure::new(Some(RESOURCE_MANAGER), None);
+            let descriptions = fake.list_tenants().unwrap();
+            assert_eq!(
+                labels(&descriptions),
+                ["Contoso (contoso.example)", "tenant-b", "tenant-c"]
+            );
+        }
+
+        #[test]
+        fn reports_resource_manager_error_when_both_sources_fail() {
+            let fake = FakeAzure::new(None, None);
+            let error = fake.list_tenants().unwrap_err();
+            assert!(matches!(
+                error,
+                AzureError::CommandFailed {
+                    operation: "az rest tenant list",
+                    status: Some(1),
+                    ..
+                }
+            ));
+            assert!(error.to_string().contains("rest tenant data unavailable"));
         }
     }
 }

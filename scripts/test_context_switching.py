@@ -195,6 +195,12 @@ class ContextSwitching(unittest.TestCase):
         self.session(['paymnts'], b'\x15payments development\r', 'dev-id',
                      b'Type to search', refresh=True)
 
+    def test_early_cache_save_keeps_previous_tenant_labels(self):
+        self.session([], b'\x1b', marker=b'Company Alpha')
+        self.log.unlink()
+        self.session([], b'\x1b', marker=b'Finance', block=True)
+        cache = (self.root / 'azure' / 'azc-picker-cache.json').read_text()
+        self.assertIn('Company Alpha', cache)
 
     def test_duplicate_names_preserve_source_identity(self):
         self.env['ACCOUNTS'] = json.dumps([
