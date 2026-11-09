@@ -127,7 +127,8 @@ INTERACTIVE KEYS:
     Alt+j/k             Move selection (Vim)
     Ctrl+P/N            Move selection (Emacs)
     Ctrl+T              Switch between subscriptions and tenants (full picker)
-    Ctrl+R              Refresh from Azure in the background (full picker)
+    Ctrl+R              Refresh from Azure in the background (full picker);
+                        Enter waits for the refreshed list, then switches
     Ctrl+B              Leave a shortlist for the full picker; clear search
     Home/End            Jump to first/last match
     Enter               Open tenant's subscriptions / switch to subscription

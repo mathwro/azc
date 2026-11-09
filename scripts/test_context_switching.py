@@ -38,6 +38,15 @@ with open(os.environ['CALL_LOG'], 'a') as log:
     log.write(json.dumps(args) + '\\n')
 if args == ['account', 'list', '--output', 'json', '--only-show-errors']:
     print(os.environ['ACCOUNTS'])
+elif args == ['account', 'list', '--output', 'json', '--only-show-errors', '--refresh']:
+    if os.environ.get('REFRESH_GATE'):
+        gate = pathlib.Path(os.environ['REFRESH_GATE'])
+        gate.with_suffix('.started').touch()
+        while not gate.exists():
+            time.sleep(.05)
+    print(os.environ['ACCOUNTS'])
+    with open(os.environ['CALL_LOG'], 'a') as log:
+        log.write(json.dumps(['refresh-returned']) + '\\n')
 elif args[:1] == ['rest'] or args[:3] == ['account', 'list', '--all']:
     if os.environ.get('BLOCK_METADATA'):
         pathlib.Path(os.environ['BLOCK_METADATA']).touch()
@@ -63,20 +72,29 @@ class ContextSwitching(unittest.TestCase):
                         CALL_LOG=str(self.log), ACCOUNTS=json.dumps(ROWS),
                         TENANTS=json.dumps(METADATA), TERM="xterm-256color")
 
-    def assert_calls(self, selected=None):
-        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
-        self.assertEqual([call for call in calls if call[:2] == ['account', 'set']],
-                         [] if selected is None else [
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def assert_calls(self, selected=None, refresh=False):
+        calls = self.calls()
+        sets = [call for call in calls if call[:2] == ['account', 'set']]
+        self.assertEqual(sets, [] if selected is None else [
                              ['account', 'set', '--subscription', selected, '--only-show-errors']])
         self.assertEqual(sum(call[:2] == ['account', 'list'] and '--all' not in call
-                             for call in calls), 1, calls)
+                             for call in calls), 1 + refresh, calls)
+        if refresh and sets:
+            self.assertLess(calls.index(['refresh-returned']), calls.index(sets[0]), calls)
 
-    def session(self, args, keys, selected=None, marker=b'Shortlist', block=False):
+    def session(self, args, keys, selected=None, marker=b'Shortlist', block=False,
+                refresh=False):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 140, 0, 0))
         original = termios.tcgetattr(slave)
         if block:
             self.env['BLOCK_METADATA'] = str(self.root / 'metadata-started')
+        gate = self.root / 'refresh.gate'
+        if refresh:
+            self.env['REFRESH_GATE'] = str(gate)
         proc = subprocess.Popen([str(BINARY), *args], env=self.env,
                                 stdin=slave, stdout=slave, stderr=slave,
                                 start_new_session=True)
@@ -102,11 +120,19 @@ class ContextSwitching(unittest.TestCase):
             read_until(lambda: marker in output)
             if block:
                 read_until(lambda: (self.root / 'metadata-started').exists())
+            if refresh:
+                os.write(master, b'\x12')
+                read_until(lambda: gate.with_suffix('.started').exists())
             os.write(master, keys)
+            if refresh:
+                # Enter is deferred while `az account list --refresh` is still running.
+                read_until(lambda: b'Waiting for Azure refresh' in output)
+                self.assertFalse([call for call in self.calls() if call[:2] == ['account', 'set']])
+                gate.touch()
             read_until(lambda: proc.poll() is not None)
             self.assertEqual(proc.returncode, 0, bytes(output))
             self.assertEqual(termios.tcgetattr(slave), original)
-            self.assert_calls(selected)
+            self.assert_calls(selected, refresh)
         finally:
             # Terminate blocked fake-Azure descendants as well as azc.
             try:
@@ -161,6 +187,14 @@ class ContextSwitching(unittest.TestCase):
 
     def test_subscription_selection_does_not_wait_for_metadata(self):
         self.session(['payments'], b'\r', 'dev-id', block=True)
+
+    def test_enter_during_refresh_switches_after_refreshed_listing(self):
+        self.session([], b'payments development\r', 'dev-id', b'finance-id', refresh=True)
+
+    def test_recovered_picker_enter_during_refresh_waits_for_listing(self):
+        self.session(['paymnts'], b'\x15payments development\r', 'dev-id',
+                     b'Type to search', refresh=True)
+
 
     def test_duplicate_names_preserve_source_identity(self):
         self.env['ACCOUNTS'] = json.dumps([
