@@ -176,13 +176,18 @@ fn run(
     loader: AccountLoader,
     mut app: App,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
+    let mut dirty = true;
     loop {
-        app.receive_accounts(&loader.accounts);
-        terminal.draw(|frame| render(frame, &mut app))?;
+        dirty |= app.receive_accounts(&loader.accounts);
+        if dirty {
+            terminal.draw(|frame| render(frame, &mut app))?;
+            dirty = false;
+        }
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    dirty = true;
                     if let Some(action) = app.handle_key(key) {
                         match action {
                             Action::Cancel => return Ok(None),
@@ -199,7 +204,11 @@ fn run(
                         }
                     }
                 }
-                Event::Paste(text) => app.append_query(&text),
+                Event::Paste(text) => {
+                    app.append_query(&text);
+                    dirty = true;
+                }
+                Event::Resize(..) => dirty = true,
                 _ => {}
             }
         }
@@ -268,13 +277,17 @@ impl App {
         app
     }
 
-    fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) {
+    /// Applies pending loader messages; returns whether any were consumed.
+    fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) -> bool {
         if !self.loading {
-            return;
+            return false;
         }
 
+        let mut changed = false;
         loop {
-            match receiver.try_recv() {
+            let message = receiver.try_recv();
+            changed |= !matches!(message, Err(TryRecvError::Empty));
+            match message {
                 Ok(LoadedAccounts::RefreshStarted) => {
                     self.awaiting_refresh = false;
                     self.refreshing = true;
@@ -313,6 +326,7 @@ impl App {
                 Err(TryRecvError::Empty) => break,
             }
         }
+        changed
     }
 
     fn replace_subscriptions(&mut self, subscriptions: Arc<Vec<Subscription>>) {
@@ -1238,6 +1252,20 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             Some(Action::Refresh)
         );
+    }
+
+    #[test]
+    fn receive_accounts_reports_whether_loader_messages_were_applied() {
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(!app.receive_accounts(&receiver));
+
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        assert!(app.receive_accounts(&receiver));
+        assert!(!app.loading);
+
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        assert!(!app.receive_accounts(&receiver));
     }
 
     #[test]
