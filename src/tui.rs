@@ -618,6 +618,22 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn current_tenant_label(app: &App) -> String {
+    app.tenants
+        .iter()
+        .find(|tenant| tenant.is_current)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |tenant| {
+                if tenant.name.is_empty() {
+                    tenant.id.clone()
+                } else {
+                    format!("{} ({})", tenant.name, tenant.id)
+                }
+            },
+        )
+}
+
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let items = if app.tenant_mode {
         app.filtered
@@ -684,20 +700,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect::<Vec<_>>()
     };
 
-    let current_tenant = app
-        .tenants
-        .iter()
-        .find(|tenant| tenant.is_current)
-        .map_or_else(
-            || "unknown".to_owned(),
-            |tenant| {
-                if tenant.name.is_empty() {
-                    tenant.id.clone()
-                } else {
-                    format!("{} ({})", tenant.name, tenant.id)
-                }
-            },
-        );
+    let current_tenant = current_tenant_label(app);
     let tenant_scope = app.scoped_tenant_id();
     let list_name = if app.tenant_mode {
         "Tenants".to_owned()
@@ -809,20 +812,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let current_tenant = app
-        .tenants
-        .iter()
-        .find(|tenant| tenant.is_current)
-        .map_or_else(
-            || "unknown".to_owned(),
-            |tenant| {
-                if tenant.name.is_empty() {
-                    tenant.id.clone()
-                } else {
-                    format!("{} ({})", tenant.name, tenant.id)
-                }
-            },
-        );
+    let current_tenant = current_tenant_label(app);
     let status = if app.selected().is_some() {
         format!(
             " Enter {} · Ctrl+R refresh · Ctrl+T {} · Esc cancel · current tenant {} ",
@@ -891,7 +881,6 @@ mod tests {
                 name: name.to_owned(),
                 tenant_id: "tenant".to_owned(),
                 is_default: index == 0,
-                state: "Enabled".to_owned(),
             })
             .collect()
     }
@@ -964,7 +953,6 @@ mod tests {
             name: "Archive HR".to_owned(),
             tenant_id: "tenant".to_owned(),
             is_default: false,
-            state: "Enabled".to_owned(),
         });
         let mut app = App::from_query(
             subscriptions,

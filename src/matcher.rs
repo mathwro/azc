@@ -265,7 +265,6 @@ mod tests {
             name: name.to_owned(),
             tenant_id: "tenant-one".to_owned(),
             is_default,
-            state: "Enabled".to_owned(),
         }
     }
 
