@@ -295,8 +295,8 @@ Publish a stable release:
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.5.0 -m "azc v0.5.0"
-git push origin v0.5.0
+git tag -a v0.5.1 -m "azc v0.5.1"
+git push origin v0.5.1
 ```
 
 The stable tag run repeats the dry-run checks with locked dependencies and waits at the protected `release` environment before creating and publishing the immutable GitHub Release. Stable publication then calls the central notifier, which verifies the exact release and sends the canonical package update event.
