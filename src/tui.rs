@@ -135,16 +135,18 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
         return false;
     }
     let cache = Cache::from_env();
-    if !refresh
-        && let Some(snapshot) = cache.as_ref().and_then(Cache::load)
-        && sender
+    let mut previous_descriptions = Vec::new();
+    if !refresh && let Some(snapshot) = cache.as_ref().and_then(Cache::load) {
+        previous_descriptions.clone_from(&snapshot.descriptions);
+        if sender
             .send(LoadedAccounts::Cached(
                 snapshot.subscriptions,
                 snapshot.descriptions,
             ))
             .is_err()
-    {
-        return false;
+        {
+            return false;
+        }
     }
     let subscriptions: Arc<Vec<Subscription>> = match azure.list_subscriptions(refresh) {
         Ok(subscriptions) => subscriptions.into(),
@@ -154,9 +156,10 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
                 .is_ok();
         }
     };
-    // Save and publish subscriptions before waiting for tenant metadata.
+    // Save and publish subscriptions before waiting for tenant metadata, keeping
+    // previous tenant labels in case the user switches before metadata arrives.
     if let Some(cache) = &cache {
-        let _ = cache.save(&subscriptions, &[]);
+        let _ = cache.save(&subscriptions, &previous_descriptions);
     }
     if sender
         .send(LoadedAccounts::Subscriptions(Arc::clone(&subscriptions)))
@@ -178,7 +181,12 @@ fn run(
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
     let mut dirty = true;
     loop {
-        dirty |= app.receive_accounts(&loader.accounts);
+        // Loader messages only arrive while loading, so redraw on every poll
+        // then; once idle, redraw only after terminal events.
+        dirty |= app.loading;
+        if app.receive_accounts(&loader.accounts) == Some(Action::Select) {
+            return Ok(app.selected().cloned());
+        }
         if dirty {
             terminal.draw(|frame| render(frame, &mut app))?;
             dirty = false;
@@ -197,6 +205,7 @@ fn run(
                                     app.loading = false;
                                     app.refreshing = false;
                                     app.awaiting_refresh = false;
+                                    app.refresh_listing = false;
                                     app.load_error =
                                         Some("subscription loader stopped unexpectedly".to_owned());
                                 }
@@ -228,6 +237,12 @@ struct App {
     loading: bool,
     refreshing: bool,
     awaiting_refresh: bool,
+    /// A server refresh's `az account list --refresh` has not returned yet.
+    /// Azure CLI writes its stale active subscription back when it finishes,
+    /// so switching must wait for it.
+    refresh_listing: bool,
+    /// Subscription ID chosen with Enter while `refresh_listing` was set.
+    pending_switch: Option<String>,
     load_error: Option<String>,
     tenant_mode: bool,
     tenant_scope: Option<String>,
@@ -249,6 +264,8 @@ impl App {
             loading: true,
             refreshing: false,
             awaiting_refresh: false,
+            refresh_listing: false,
+            pending_switch: None,
             load_error: None,
             tenant_mode,
             tenant_scope: None,
@@ -277,20 +294,17 @@ impl App {
         app
     }
 
-    /// Applies pending loader messages; returns whether any were consumed.
-    fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) -> bool {
+    fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) -> Option<Action> {
         if !self.loading {
-            return false;
+            return None;
         }
 
-        let mut changed = false;
         loop {
-            let message = receiver.try_recv();
-            changed |= !matches!(message, Err(TryRecvError::Empty));
-            match message {
+            match receiver.try_recv() {
                 Ok(LoadedAccounts::RefreshStarted) => {
                     self.awaiting_refresh = false;
                     self.refreshing = true;
+                    self.refresh_listing = true;
                 }
                 // The initial load may finish after Ctrl+R queues a server refresh.
                 Ok(_) if self.awaiting_refresh => {}
@@ -302,6 +316,11 @@ impl App {
                 Ok(LoadedAccounts::Subscriptions(subscriptions)) => {
                     self.replace_subscriptions(subscriptions);
                     self.cached = false;
+                    self.refresh_listing = false;
+                    let switch = self.take_pending_switch();
+                    if switch.is_some() {
+                        return switch;
+                    }
                 }
                 Ok(LoadedAccounts::Tenants(descriptions)) => {
                     self.descriptions = descriptions;
@@ -310,23 +329,36 @@ impl App {
                     self.refreshing = false;
                     break;
                 }
+                // The refreshing Azure CLI process has exited, so it can no longer
+                // overwrite the context; Azure CLI validates the ID when switching.
                 Ok(LoadedAccounts::Failed(error)) => {
                     self.loading = false;
                     self.refreshing = false;
+                    self.refresh_listing = false;
                     self.load_error = Some(error);
-                    break;
+                    return self.take_pending_switch();
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.loading = false;
                     self.refreshing = false;
                     self.awaiting_refresh = false;
+                    self.refresh_listing = false;
+                    self.pending_switch = None;
                     self.load_error = Some("subscription loader stopped unexpectedly".to_owned());
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
             }
         }
-        changed
+        None
+    }
+
+    /// Completes a deferred Enter if its subscription is still highlighted.
+    fn take_pending_switch(&mut self) -> Option<Action> {
+        let id = self.pending_switch.take()?;
+        self.selected()
+            .is_some_and(|subscription| subscription.id == id)
+            .then_some(Action::Select)
     }
 
     fn replace_subscriptions(&mut self, subscriptions: Arc<Vec<Subscription>>) {
@@ -369,6 +401,21 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // Any key other than Enter abandons a deferred switch.
+        self.pending_switch = None;
+        // Windows reports AltGr as Ctrl+Alt with the produced character, and
+        // that cannot be told apart from a literal Ctrl+Alt chord, so keep it
+        // searchable rather than treating it as an Alt or Ctrl shortcut.
+        if let KeyCode::Char(character) = key.code
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !character.is_control()
+        {
+            self.query.push(character);
+            self.refresh_filter();
+            return None;
+        }
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('j') => {
@@ -390,6 +437,7 @@ impl App {
                     self.loading = true;
                     self.refreshing = true;
                     self.awaiting_refresh = true;
+                    self.refresh_listing = true;
                     self.load_error = None;
                     Some(Action::Refresh)
                 }
@@ -443,6 +491,10 @@ impl App {
                     self.query.clear();
                     self.refresh_filter();
                     None
+                } else if self.refresh_listing {
+                    self.pending_switch =
+                        self.selected().map(|subscription| subscription.id.clone());
+                    None
                 } else {
                     Some(Action::Select)
                 }
@@ -478,6 +530,7 @@ impl App {
     }
 
     fn append_query(&mut self, text: &str) {
+        self.pending_switch = None;
         self.query
             .extend(text.chars().filter(|character| !character.is_control()));
         self.refresh_filter();
@@ -618,6 +671,22 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn current_tenant_label(app: &App) -> String {
+    app.tenants
+        .iter()
+        .find(|tenant| tenant.is_current)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |tenant| {
+                if tenant.name.is_empty() {
+                    tenant.id.clone()
+                } else {
+                    format!("{} ({})", tenant.name, tenant.id)
+                }
+            },
+        )
+}
+
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let items = if app.tenant_mode {
         app.filtered
@@ -684,20 +753,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect::<Vec<_>>()
     };
 
-    let current_tenant = app
-        .tenants
-        .iter()
-        .find(|tenant| tenant.is_current)
-        .map_or_else(
-            || "unknown".to_owned(),
-            |tenant| {
-                if tenant.name.is_empty() {
-                    tenant.id.clone()
-                } else {
-                    format!("{} ({})", tenant.name, tenant.id)
-                }
-            },
-        );
+    let current_tenant = current_tenant_label(app);
     let tenant_scope = app.scoped_tenant_id();
     let list_name = if app.tenant_mode {
         "Tenants".to_owned()
@@ -794,6 +850,17 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(subscription) = app.pending_switch.as_ref().and(app.selected()) {
+        let status = format!(
+            " Waiting for Azure refresh to switch to {} · Esc cancel ",
+            subscription.name
+        );
+        frame.render_widget(
+            Paragraph::new(status).style(Style::new().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
     if app.shortlist.is_some() {
         let status = format!(
             " Shortlist · {} · Ctrl+B full picker · Esc cancel ",
@@ -809,20 +876,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let current_tenant = app
-        .tenants
-        .iter()
-        .find(|tenant| tenant.is_current)
-        .map_or_else(
-            || "unknown".to_owned(),
-            |tenant| {
-                if tenant.name.is_empty() {
-                    tenant.id.clone()
-                } else {
-                    format!("{} ({})", tenant.name, tenant.id)
-                }
-            },
-        );
+    let current_tenant = current_tenant_label(app);
     let status = if app.selected().is_some() {
         format!(
             " Enter {} · Ctrl+R refresh · Ctrl+T {} · Esc cancel · current tenant {} ",
@@ -891,7 +945,6 @@ mod tests {
                 name: name.to_owned(),
                 tenant_id: "tenant".to_owned(),
                 is_default: index == 0,
-                state: "Enabled".to_owned(),
             })
             .collect()
     }
@@ -964,7 +1017,6 @@ mod tests {
             name: "Archive HR".to_owned(),
             tenant_id: "tenant".to_owned(),
             is_default: false,
-            state: "Enabled".to_owned(),
         });
         let mut app = App::from_query(
             subscriptions,
@@ -1255,20 +1307,6 @@ mod tests {
     }
 
     #[test]
-    fn receive_accounts_reports_whether_loader_messages_were_applied() {
-        let mut app = App::new(false);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        assert!(!app.receive_accounts(&receiver));
-
-        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
-        assert!(app.receive_accounts(&receiver));
-        assert!(!app.loading);
-
-        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
-        assert!(!app.receive_accounts(&receiver));
-    }
-
-    #[test]
     fn failed_refresh_retains_results_and_can_be_requested_again() {
         let mut app = loaded_app();
         app.append_query("hr");
@@ -1292,6 +1330,159 @@ mod tests {
         );
         assert!(app.loading);
         assert!(app.load_error.is_none());
+    }
+
+    fn footer(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
+        let frame = terminal.draw(|frame| render(frame, app)).unwrap();
+        frame.buffer.content()[500..]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
+        app.handle_key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn enter_during_refresh_listing_switches_after_refreshed_subscriptions() {
+        let mut app = loaded_app();
+        app.append_query("hr");
+        app.next();
+        assert_eq!(
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Some(Action::Refresh)
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        assert_eq!(app.receive_accounts(&receiver), None);
+
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(footer(&mut app).contains("Waiting for Azure refresh to switch to HR Production"));
+        assert_eq!(app.receive_accounts(&receiver), None);
+
+        let mut refreshed = subscriptions();
+        refreshed.reverse();
+        sender
+            .send(LoadedAccounts::Subscriptions(refreshed.into()))
+            .unwrap();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert_eq!(app.selected().unwrap().id, "1");
+    }
+
+    #[test]
+    fn enter_during_queued_refresh_waits_past_superseded_startup_results() {
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(LoadedAccounts::Cached(subscriptions(), vec![]))
+            .unwrap();
+        app.receive_accounts(&receiver);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::Select)
+        );
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        assert_eq!(app.receive_accounts(&receiver), None);
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        assert_eq!(app.receive_accounts(&receiver), None);
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert_eq!(app.selected().unwrap().id, "0");
+    }
+
+    #[test]
+    fn deferred_switch_clears_when_refresh_removes_the_subscription() {
+        let mut app = loaded_app();
+        app.append_query("hr");
+        app.next();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        let refreshed: Vec<_> = subscriptions()
+            .into_iter()
+            .filter(|subscription| subscription.id != "1")
+            .collect();
+        sender
+            .send(LoadedAccounts::Subscriptions(refreshed.into()))
+            .unwrap();
+
+        assert_eq!(app.receive_accounts(&receiver), None);
+        assert!(app.selected().is_none());
+        assert!(!footer(&mut app).contains("Waiting for Azure refresh"));
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        // Tenant metadata is still loading, but it never delays a switch.
+        app.next();
+        assert!(app.loading);
+        assert_eq!(app.selected().unwrap().id, "2");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::Select)
+        );
+    }
+
+    #[test]
+    fn deferred_switch_is_abandoned_by_cancel_or_further_input() {
+        for (code, modifiers) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = loaded_app();
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+            assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+            assert_eq!(press(&mut app, code, modifiers), Some(Action::Cancel));
+        }
+
+        let mut app = loaded_app();
+        app.append_query("hr");
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        app.append_query(" production");
+        assert_eq!(app.selected().unwrap().id, "1");
+        assert!(!footer(&mut app).contains("Waiting for Azure refresh"));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        assert_eq!(app.receive_accounts(&receiver), None);
+        assert!(!app.loading);
+        assert_eq!(app.selected().unwrap().id, "1");
+    }
+
+    #[test]
+    fn failed_refresh_completes_the_deferred_switch() {
+        let mut app = loaded_app();
+        app.append_query("hr");
+        app.next();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        app.receive_accounts(&receiver);
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        sender
+            .send(LoadedAccounts::Failed("refresh failed".to_owned()))
+            .unwrap();
+
+        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert!(app.load_error.is_some());
+        assert_eq!(app.selected().unwrap().id, "1");
     }
 
     #[test]
@@ -1320,6 +1511,27 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.query, "j");
+    }
+
+    #[test]
+    fn altgr_characters_reported_as_ctrl_alt_become_search_text() {
+        let mut app = loaded_app();
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+        for character in ['ł', '@', 'j'] {
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), altgr)),
+                None
+            );
+        }
+        assert_eq!(app.query, "ł@j");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.query, "");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Cancel)
+        );
     }
 
     #[test]

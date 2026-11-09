@@ -31,10 +31,25 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, C
     match arguments.as_slice() {
         [argument] if argument == "update" => return Ok(Command::Update),
         [argument] if argument == "version" => return Ok(Command::Version),
-        [command, rest @ ..] if command == "tenant" => return parse_tenant(rest),
+        [command, ..] if command == "tenant" => {
+            return parse_query(arguments.into_iter().skip(1), |query, refresh| {
+                Command::Tenant { query, refresh }
+            });
+        }
         _ => {}
     }
 
+    parse_query(arguments, |query, refresh| match query {
+        Some(query) => Command::Switch { query, refresh },
+        None => Command::Interactive { refresh },
+    })
+}
+
+/// Parses the options and query words shared by the top-level command and `tenant`.
+fn parse_query(
+    arguments: impl IntoIterator<Item = String>,
+    command: impl FnOnce(Option<String>, bool) -> Command,
+) -> Result<Command, CliError> {
     let mut refresh = false;
     let mut positional_only = false;
     let mut query_parts = Vec::new();
@@ -59,45 +74,8 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, C
         }
     }
 
-    if query_parts.is_empty() {
-        Ok(Command::Interactive { refresh })
-    } else {
-        Ok(Command::Switch {
-            query: query_parts.join(" "),
-            refresh,
-        })
-    }
-}
-
-fn parse_tenant(arguments: &[String]) -> Result<Command, CliError> {
-    let mut refresh = false;
-    let mut positional_only = false;
-    let mut query_parts = Vec::new();
-
-    for argument in arguments {
-        if positional_only {
-            query_parts.push(argument.clone());
-            continue;
-        }
-
-        match argument.as_str() {
-            "--" => positional_only = true,
-            "-h" | "--help" => return Ok(Command::Help),
-            "-V" | "--version" => return Ok(Command::Version),
-            "-r" | "--refresh" => refresh = true,
-            value if value.starts_with('-') => {
-                return Err(CliError(format!(
-                    "unknown option '{value}'; run 'azc --help' for usage"
-                )));
-            }
-            _ => query_parts.push(argument.clone()),
-        }
-    }
-
-    Ok(Command::Tenant {
-        query: (!query_parts.is_empty()).then(|| query_parts.join(" ")),
-        refresh,
-    })
+    let query = (!query_parts.is_empty()).then(|| query_parts.join(" "));
+    Ok(command(query, refresh))
 }
 
 pub fn help() -> &'static str {
@@ -127,7 +105,8 @@ INTERACTIVE KEYS:
     Alt+j/k             Move selection (Vim)
     Ctrl+P/N            Move selection (Emacs)
     Ctrl+T              Switch between subscriptions and tenants (full picker)
-    Ctrl+R              Refresh from Azure in the background (full picker)
+    Ctrl+R              Refresh from Azure in the background (full picker);
+                        Enter waits for the refreshed list, then switches
     Ctrl+B              Leave a shortlist for the full picker; clear search
     Home/End            Jump to first/last match
     Enter               Open tenant's subscriptions / switch to subscription
