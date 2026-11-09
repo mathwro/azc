@@ -9,8 +9,6 @@ pub struct Subscription {
     pub tenant_id: String,
     #[serde(default)]
     pub is_default: bool,
-    #[serde(default)]
-    pub state: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -132,21 +130,18 @@ mod tenant_tests {
                 name: "One".to_owned(),
                 tenant_id: "tenant-a".to_owned(),
                 is_default: false,
-                state: "Enabled".to_owned(),
             },
             Subscription {
                 id: "two".to_owned(),
                 name: "Two".to_owned(),
                 tenant_id: "tenant-a".to_owned(),
                 is_default: true,
-                state: "Enabled".to_owned(),
             },
             Subscription {
                 id: "three".to_owned(),
                 name: "Three".to_owned(),
                 tenant_id: "tenant-b".to_owned(),
                 is_default: false,
-                state: "Enabled".to_owned(),
             },
         ];
         let descriptions = vec![
@@ -192,7 +187,6 @@ mod tenant_tests {
             name: "One".to_owned(),
             tenant_id: "tenant-a".to_owned(),
             is_default: false,
-            state: "Enabled".to_owned(),
         }];
         let descriptions = vec![TenantDescription {
             tenant_id: "tenant-a".to_owned(),
@@ -261,6 +255,5 @@ mod tests {
 
         assert_eq!(subscription.tenant_id, "");
         assert!(!subscription.is_default);
-        assert_eq!(subscription.state, "");
     }
 }
