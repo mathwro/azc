@@ -355,6 +355,20 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // Windows reports AltGr as Ctrl+Alt with the produced character, and
+        // that cannot be told apart from a literal Ctrl+Alt chord, so keep it
+        // searchable rather than treating it as an Alt or Ctrl shortcut.
+        if let KeyCode::Char(character) = key.code
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !character.is_control()
+        {
+            self.query.push(character);
+            self.refresh_filter();
+            return None;
+        }
+
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('j') => {
@@ -1292,6 +1306,27 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.query, "j");
+    }
+
+    #[test]
+    fn altgr_characters_reported_as_ctrl_alt_become_search_text() {
+        let mut app = loaded_app();
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+        for character in ['ł', '@', 'j'] {
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), altgr)),
+                None
+            );
+        }
+        assert_eq!(app.query, "ł@j");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.query, "");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Cancel)
+        );
     }
 
     #[test]
