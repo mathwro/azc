@@ -162,6 +162,13 @@ class ContextSwitching(unittest.TestCase):
     def test_subscription_selection_does_not_wait_for_metadata(self):
         self.session(['payments'], b'\r', 'dev-id', block=True)
 
+    def test_early_cache_save_keeps_previous_tenant_labels(self):
+        self.session([], b'\x1b', marker=b'Company Alpha')
+        self.log.unlink()
+        self.session([], b'\x1b', marker=b'Finance', block=True)
+        cache = (self.root / 'azure' / 'azc-picker-cache.json').read_text()
+        self.assertIn('Company Alpha', cache)
+
     def test_duplicate_names_preserve_source_identity(self):
         self.env['ACCOUNTS'] = json.dumps([
             dict(id=sid, name='Same Name', tenantId='tenant-a')

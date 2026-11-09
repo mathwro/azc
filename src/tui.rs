@@ -135,16 +135,18 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
         return false;
     }
     let cache = Cache::from_env();
-    if !refresh
-        && let Some(snapshot) = cache.as_ref().and_then(Cache::load)
-        && sender
+    let mut previous_descriptions = Vec::new();
+    if !refresh && let Some(snapshot) = cache.as_ref().and_then(Cache::load) {
+        previous_descriptions.clone_from(&snapshot.descriptions);
+        if sender
             .send(LoadedAccounts::Cached(
                 snapshot.subscriptions,
                 snapshot.descriptions,
             ))
             .is_err()
-    {
-        return false;
+        {
+            return false;
+        }
     }
     let subscriptions: Arc<Vec<Subscription>> = match azure.list_subscriptions(refresh) {
         Ok(subscriptions) => subscriptions.into(),
@@ -154,9 +156,10 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
                 .is_ok();
         }
     };
-    // Save and publish subscriptions before waiting for tenant metadata.
+    // Save and publish subscriptions before waiting for tenant metadata, keeping
+    // previous tenant labels in case the user switches before metadata arrives.
     if let Some(cache) = &cache {
-        let _ = cache.save(&subscriptions, &[]);
+        let _ = cache.save(&subscriptions, &previous_descriptions);
     }
     if sender
         .send(LoadedAccounts::Subscriptions(Arc::clone(&subscriptions)))
