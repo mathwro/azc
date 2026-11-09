@@ -179,15 +179,23 @@ fn run(
     loader: AccountLoader,
     mut app: App,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
+    let mut dirty = true;
     loop {
+        // Loader messages only arrive while loading, so redraw on every poll
+        // then; once idle, redraw only after terminal events.
+        dirty |= app.loading;
         if app.receive_accounts(&loader.accounts) == Some(Action::Select) {
             return Ok(app.selected().cloned());
         }
-        terminal.draw(|frame| render(frame, &mut app))?;
+        if dirty {
+            terminal.draw(|frame| render(frame, &mut app))?;
+            dirty = false;
+        }
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    dirty = true;
                     if let Some(action) = app.handle_key(key) {
                         match action {
                             Action::Cancel => return Ok(None),
@@ -205,7 +213,11 @@ fn run(
                         }
                     }
                 }
-                Event::Paste(text) => app.append_query(&text),
+                Event::Paste(text) => {
+                    app.append_query(&text);
+                    dirty = true;
+                }
+                Event::Resize(..) => dirty = true,
                 _ => {}
             }
         }
