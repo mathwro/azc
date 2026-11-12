@@ -90,7 +90,7 @@ COMMANDS:
     azc <query>         Switch to the unique best subscription match
     azc tenant          Open the tenant picker
     azc tenant <query>  Switch to the unique best tenant match
-    azc update          Reinstall the latest version from GitHub
+    azc update          Reinstall the latest Cargo build from GitHub
     azc version         Print the installed version
 
 OPTIONS:

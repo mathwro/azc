@@ -17,7 +17,7 @@
 - Ordinary listing uses Azure CLI's local account data. `--refresh` bypasses picker snapshots; it and interactive `Ctrl+R` explicitly request a server refresh. Only interactive mode may show a recent last-run snapshot while reloading; direct queries always use Azure CLI output.
 - Background picker updates preserve query and switch target by subscription ID. Clear selection when that target disappears or no longer matches; cached rows may be selected, but Azure CLI remains authoritative for switching.
 - Keep picker loads on one background thread. `Ctrl+R` queues one refresh behind startup loading, ignores superseded startup results, and coalesces further presses until completion.
-- `azc update` reinstalls from the manifest repository with Cargo; `azc version` reports `CARGO_PKG_VERSION`. `azc -- update` and `azc -- version` preserve those words as direct queries.
+- `azc update` reinstalls Cargo-installed builds from the manifest repository with Cargo and refuses Homebrew, Scoop, and prebuilt-release binaries with package-manager guidance; `azc version` reports `CARGO_PKG_VERSION`. `azc -- update` and `azc -- version` preserve those words as direct queries.
 - Windows PowerShell, Linux, and macOS are first-class. Keep platform-specific process and terminal behavior isolated and compile-checkable.
 
 ## Code map
@@ -61,7 +61,7 @@ The supported self-update contract is:
 cargo install --git <CARGO_PKG_REPOSITORY> --locked --force
 ```
 
-Execute Cargo directly without a shell. Unix waits for Cargo and propagates failure. Windows starts Cargo and exits so the running `azc.exe` does not block replacement.
+Execute Cargo directly without a shell for Cargo/source builds; reject Homebrew, Scoop, and `RELEASE_COMMIT` prebuilt release binaries before spawning Cargo so package-manager installs are never shadowed by a second binary in `~/.cargo/bin`. Unix waits for Cargo and propagates failure. Windows starts Cargo and exits so the running `azc.exe` does not block replacement.
 
 ## Implementation rules
 

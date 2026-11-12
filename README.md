@@ -107,7 +107,7 @@ The update command runs:
 cargo install --git https://github.com/mathwro/azc --locked --force
 ```
 
-It therefore requires Cargo, network access to GitHub, and permission to write to Cargo's binary directory. On Windows, `azc` starts Cargo and exits so that Cargo can replace the running executable; keep the terminal open until Cargo finishes. If you installed `azc` through Scoop or Homebrew, update with `scoop update azc` or `brew upgrade mathwro/tools/azc` instead so Cargo does not place a second binary in `~/.cargo/bin`.
+It therefore requires Cargo, network access to GitHub, and permission to write to Cargo's binary directory. On Windows, `azc` starts Cargo and exits so that Cargo can replace the running executable; keep the terminal open until Cargo finishes. If `azc` was installed via Homebrew, Scoop, or a prebuilt release archive, `azc update` refuses to run Cargo and prints the matching `brew upgrade mathwro/tools/azc`, `scoop update azc`, or GitHub Releases instruction instead of creating a duplicate binary in `~/.cargo/bin`.
 
 ## Interactive picker
 
