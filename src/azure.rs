@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     error::Error,
     ffi::OsString,
@@ -109,13 +110,27 @@ impl AzureCli {
         descriptions: &mut Vec<TenantDescription>,
         metadata: &[TenantDescription],
     ) {
+        if metadata.is_empty() {
+            return;
+        }
+
+        let mut index_by_tenant: HashMap<String, usize> =
+            HashMap::with_capacity(descriptions.len());
+        for (index, description) in descriptions.iter().enumerate() {
+            index_by_tenant
+                .entry(description.tenant_id.trim().to_ascii_lowercase())
+                .or_insert(index);
+        }
+
+        let mut key = String::new();
         for metadata in metadata {
-            if let Some(description) = descriptions.iter_mut().find(|description| {
-                description
-                    .tenant_id
-                    .trim()
-                    .eq_ignore_ascii_case(metadata.tenant_id.trim())
-            }) {
+            let trimmed = metadata.tenant_id.trim();
+            key.clear();
+            key.push_str(trimmed);
+            key.make_ascii_lowercase();
+
+            if let Some(&index) = index_by_tenant.get(key.as_str()) {
+                let description = &mut descriptions[index];
                 if description.meaningful_name().is_none()
                     && let Some(name) = metadata.meaningful_name()
                 {
@@ -126,8 +141,10 @@ impl AzureCli {
                 {
                     description.default_domain = metadata.default_domain.clone();
                 }
-            } else if !metadata.tenant_id.trim().is_empty() {
+            } else if !trimmed.is_empty() {
+                let index = descriptions.len();
                 descriptions.push(metadata.clone());
+                index_by_tenant.insert(key.clone(), index);
             }
         }
     }
@@ -546,6 +563,279 @@ mod tests {
 
         assert_eq!(descriptions.len(), 2);
         assert_eq!(descriptions[1], metadata[0]);
+    }
+
+    fn reference_merge_tenant_metadata(
+        descriptions: &mut Vec<TenantDescription>,
+        metadata: &[TenantDescription],
+    ) {
+        for metadata in metadata {
+            if let Some(description) = descriptions.iter_mut().find(|description| {
+                description
+                    .tenant_id
+                    .trim()
+                    .eq_ignore_ascii_case(metadata.tenant_id.trim())
+            }) {
+                if description.meaningful_name().is_none()
+                    && let Some(name) = metadata.meaningful_name()
+                {
+                    description.display_name = name.to_owned();
+                }
+                if description.default_domain.trim().is_empty()
+                    && !metadata.default_domain.trim().is_empty()
+                {
+                    description.default_domain = metadata.default_domain.clone();
+                }
+            } else if !metadata.tenant_id.trim().is_empty() {
+                descriptions.push(metadata.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn merge_preserves_first_match_order_whitespace_case_and_progressive_appends() {
+        let guid_a = "11111111-2222-3333-4444-555555555555";
+        let initial_descriptions = vec![
+            // Duplicate tenant IDs in initial descriptions: first match must win.
+            tenant("  tenant-dup  ", "", ""),
+            tenant("TENANT-DUP", "", ""),
+            // Existing tenant with GUID display_name (non-meaningful) and empty domain.
+            tenant(guid_a, guid_a, "   "),
+            // Empty/whitespace tenant ID already in descriptions.
+            tenant("   ", "", ""),
+        ];
+        let metadata = vec![
+            // Whitespace/empty metadata records match existing empty entry or get ignored.
+            tenant("", "Empty Name", "empty.example"),
+            tenant(" \t ", "Ignored Second Empty", "ignored.example"),
+            // Matches FIRST duplicate entry in descriptions (index 0), leaving index 1 untouched.
+            tenant("Tenant-Dup", "First Dup Name", ""),
+            tenant("  TENANT-DUP\n", "Later Dup Name", "dup.example"),
+            // Replaces GUID name with meaningful name and fills blank domain.
+            tenant(
+                "  11111111-2222-3333-4444-555555555555 ",
+                "Guid Resolved",
+                "guid.example",
+            ),
+            // Appends new tenant with empty fields, then progressively fills name and domain
+            // across subsequent subscription metadata records with varied case/whitespace.
+            tenant("  tenant-new ", "", ""),
+            tenant("TENANT-NEW", "tenant-new", "new.example"),
+            tenant(
+                "tenant-new",
+                "  Northwind Traders  ",
+                "ignored-later.example",
+            ),
+            tenant("TENANT-NEW", "Ignored Later Name", "ignored-2.example"),
+        ];
+
+        let mut actual = initial_descriptions.clone();
+        let mut expected = initial_descriptions;
+        AzureCli::merge_tenant_metadata(&mut actual, &metadata);
+        reference_merge_tenant_metadata(&mut expected, &metadata);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 5);
+        assert_eq!(actual[0].display_name, "First Dup Name");
+        assert_eq!(actual[0].default_domain, "dup.example");
+        assert_eq!(actual[1].display_name, "");
+        assert_eq!(actual[1].default_domain, "");
+        assert_eq!(actual[2].display_name, "Guid Resolved");
+        assert_eq!(actual[2].default_domain, "guid.example");
+        assert_eq!(actual[3].display_name, "Empty Name");
+        assert_eq!(actual[3].default_domain, "empty.example");
+        assert_eq!(actual[4].tenant_id, "  tenant-new ");
+        assert_eq!(actual[4].display_name, "Northwind Traders");
+        assert_eq!(actual[4].default_domain, "new.example");
+    }
+
+    #[test]
+    fn merge_matches_reference_across_generated_edge_cases() {
+        let tenant_pool = [
+            "",
+            "   ",
+            "tenant-0",
+            "TENANT-0",
+            "  tenant-0  ",
+            "tenant-1",
+            "  TENANT-1\t",
+            "00000000-1111-2222-3333-444444444444",
+            "  00000000-1111-2222-3333-444444444444  ",
+            "tenant-only-meta-a",
+            "TENANT-ONLY-META-A",
+            "tenant-only-meta-b",
+        ];
+        let name_pool = [
+            "",
+            "   ",
+            "tenant-0",
+            "00000000-1111-2222-3333-444444444444",
+            "Contoso",
+            "  Fabrikam  ",
+            "Adventure Works",
+        ];
+        let domain_pool = ["", "   ", "contoso.example", "fabrikam.onmicrosoft.com"];
+
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next_usize = |bound: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as usize) % bound
+        };
+
+        for _case in 0..200 {
+            let desc_len = next_usize(12);
+            let meta_len = next_usize(40);
+            let initial: Vec<TenantDescription> = (0..desc_len)
+                .map(|_| {
+                    tenant(
+                        tenant_pool[next_usize(tenant_pool.len())],
+                        name_pool[next_usize(name_pool.len())],
+                        domain_pool[next_usize(domain_pool.len())],
+                    )
+                })
+                .collect();
+            let metadata: Vec<TenantDescription> = (0..meta_len)
+                .map(|_| {
+                    tenant(
+                        tenant_pool[next_usize(tenant_pool.len())],
+                        name_pool[next_usize(name_pool.len())],
+                        domain_pool[next_usize(domain_pool.len())],
+                    )
+                })
+                .collect();
+
+            let mut actual = initial.clone();
+            let mut expected = initial;
+            AzureCli::merge_tenant_metadata(&mut actual, &metadata);
+            reference_merge_tenant_metadata(&mut expected, &metadata);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    fn enterprise_merge_fixture(
+        tenant_count: usize,
+        subscription_count: usize,
+    ) -> (Vec<TenantDescription>, Vec<TenantDescription>) {
+        let descriptions: Vec<TenantDescription> = (0..tenant_count)
+            .map(|i| {
+                let id = format!("{i:08x}-1111-2222-3333-{i:012x}");
+                if i % 3 == 0 {
+                    tenant(
+                        &id,
+                        &format!("Enterprise Tenant {i}"),
+                        &format!("t{i}.example"),
+                    )
+                } else {
+                    tenant(&id, "", "")
+                }
+            })
+            .collect();
+
+        let total_tenants = tenant_count + 50;
+        let metadata: Vec<TenantDescription> = (0..subscription_count)
+            .map(|s| {
+                let t = (s * 37) % total_tenants;
+                let id = if s % 2 == 0 {
+                    format!("{t:08x}-1111-2222-3333-{t:012x}")
+                } else {
+                    format!("  {t:08X}-1111-2222-3333-{t:012X} ")
+                };
+                let name = if s % 4 == 0 { "" } else { "Contoso Division" };
+                let domain = if s % 5 == 0 {
+                    ""
+                } else {
+                    "contoso.onmicrosoft.com"
+                };
+                tenant(&id, name, domain)
+            })
+            .collect();
+
+        (descriptions, metadata)
+    }
+
+    #[test]
+    fn merge_matches_reference_at_enterprise_scale() {
+        let (mut actual, metadata) = enterprise_merge_fixture(500, 10_000);
+        let mut expected = actual.clone();
+
+        AzureCli::merge_tenant_metadata(&mut actual, &metadata);
+        reference_merge_tenant_metadata(&mut expected, &metadata);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 550);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_merge_tenant_metadata_enterprise_scale() {
+        let (base_descriptions, metadata) = enterprise_merge_fixture(500, 10_000);
+        let warmup = 5;
+        let iterations = 41;
+
+        for _ in 0..warmup {
+            let mut d = std::hint::black_box(base_descriptions.clone());
+            reference_merge_tenant_metadata(&mut d, std::hint::black_box(metadata.as_slice()));
+            std::hint::black_box(d);
+
+            let mut d2 = std::hint::black_box(base_descriptions.clone());
+            AzureCli::merge_tenant_metadata(&mut d2, std::hint::black_box(metadata.as_slice()));
+            std::hint::black_box(d2);
+        }
+
+        let mut baseline_samples = Vec::with_capacity(iterations);
+        let mut optimized_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let mut d_ref = base_descriptions.clone();
+            let start_ref = std::time::Instant::now();
+            reference_merge_tenant_metadata(
+                std::hint::black_box(&mut d_ref),
+                std::hint::black_box(metadata.as_slice()),
+            );
+            baseline_samples.push(start_ref.elapsed());
+
+            let mut d_opt = base_descriptions.clone();
+            let start_opt = std::time::Instant::now();
+            AzureCli::merge_tenant_metadata(
+                std::hint::black_box(&mut d_opt),
+                std::hint::black_box(metadata.as_slice()),
+            );
+            optimized_samples.push(start_opt.elapsed());
+
+            assert_eq!(d_opt, d_ref);
+        }
+
+        baseline_samples.sort_unstable();
+        optimized_samples.sort_unstable();
+        let baseline_median = baseline_samples[iterations / 2];
+        let optimized_median = optimized_samples[iterations / 2];
+        let baseline_mean_us = baseline_samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1_000_000.0)
+            .sum::<f64>()
+            / iterations as f64;
+        let optimized_mean_us = optimized_samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1_000_000.0)
+            .sum::<f64>()
+            / iterations as f64;
+        let baseline_median_us = baseline_median.as_secs_f64() * 1_000_000.0;
+        let optimized_median_us = optimized_median.as_secs_f64() * 1_000_000.0;
+        let speedup = baseline_median_us / optimized_median_us.max(0.001);
+
+        println!(
+            "bench_merge_tenant_metadata_enterprise_scale (500 tenants + 10,000 subscription records, {iterations} iterations):"
+        );
+        println!(
+            "  baseline O(T*M) linear scan : median = {baseline_median_us:.1} us ({:.3} ms), mean = {baseline_mean_us:.1} us",
+            baseline_median_us / 1_000.0
+        );
+        println!(
+            "  current  merge_tenant_metadata: median = {optimized_median_us:.1} us ({:.3} ms), mean = {optimized_mean_us:.1} us",
+            optimized_median_us / 1_000.0
+        );
+        println!("  speedup (median)            : {speedup:.2}x");
     }
 
     #[test]
