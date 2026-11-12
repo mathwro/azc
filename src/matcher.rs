@@ -202,9 +202,28 @@ fn sort_match_entries(
 }
 #[inline]
 fn cmp_ascii_ignore_case(a: &[u8], b: &[u8]) -> Ordering {
-    a.iter()
-        .map(u8::to_ascii_lowercase)
-        .cmp(b.iter().map(u8::to_ascii_lowercase))
+    let common = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= common {
+        if a[i..i + 8] == b[i..i + 8] {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    while i < common {
+        let ca = a[i];
+        let cb = b[i];
+        if ca != cb {
+            let la = ca.to_ascii_lowercase();
+            let lb = cb.to_ascii_lowercase();
+            if la != lb {
+                return la.cmp(&lb);
+            }
+        }
+        i += 1;
+    }
+    a.len().cmp(&b.len())
 }
 
 #[inline]
@@ -288,6 +307,7 @@ fn ascii_name_rank(name: &str, query: &str) -> Option<MatchScore> {
     let first_upper = first_lower.to_ascii_uppercase();
     let last_lower = n[len - 1];
     let last_upper = last_lower.to_ascii_uppercase();
+    let query_is_alnum = n.iter().all(u8::is_ascii_alphanumeric);
     let limit = h.len() - len;
     let mut substring_hit = false;
     for pos in 1..=limit {
@@ -301,7 +321,7 @@ fn ascii_name_rank(name: &str, query: &str) -> Option<MatchScore> {
                             || h[pos + 1..pos + len - 1].eq_ignore_ascii_case(&n[1..len - 1]))
                 }))
         {
-            if !h[pos - 1].is_ascii_alphanumeric() && n.iter().all(u8::is_ascii_alphanumeric) {
+            if query_is_alnum && !h[pos - 1].is_ascii_alphanumeric() {
                 return Some(MatchScore(2));
             }
             substring_hit = true;
