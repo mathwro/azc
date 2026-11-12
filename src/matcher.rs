@@ -202,30 +202,9 @@ fn sort_match_entries(
 }
 #[inline]
 fn cmp_ascii_ignore_case(a: &[u8], b: &[u8]) -> Ordering {
-    let common = a.len().min(b.len());
-    let mut i = 0;
-    while i + 8 <= common {
-        let wa = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
-        let wb = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
-        if wa == wb {
-            i += 8;
-            continue;
-        }
-        break;
-    }
-    while i < common {
-        let ca = a[i];
-        let cb = b[i];
-        if ca != cb {
-            let la = ca.to_ascii_lowercase();
-            let lb = cb.to_ascii_lowercase();
-            if la != lb {
-                return la.cmp(&lb);
-            }
-        }
-        i += 1;
-    }
-    a.len().cmp(&b.len())
+    a.iter()
+        .map(u8::to_ascii_lowercase)
+        .cmp(b.iter().map(u8::to_ascii_lowercase))
 }
 
 #[inline]
@@ -257,69 +236,6 @@ fn ascii_starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
 }
 
 #[inline]
-fn find_ascii_case_insensitive_byte(
-    haystack: &[u8],
-    mut i: usize,
-    limit: usize,
-    first_lower: u8,
-    first_upper: u8,
-) -> Option<usize> {
-    if first_lower != first_upper {
-        // `first_lower` is `'a'..='z'` (`0x61..=0x7A`); for ASCII `b`, `(b | 0x20) == first_lower`
-        // holds iff `b == first_lower || b == first_upper`.
-        let mask = u64::from_ne_bytes([first_lower; 8]);
-        let case_bit = u64::from_ne_bytes([0x20; 8]);
-        let ones = u64::from_ne_bytes([0x01; 8]);
-        let highs = u64::from_ne_bytes([0x80; 8]);
-        while i + 8 <= limit + 1 {
-            let chunk = u64::from_ne_bytes(haystack[i..i + 8].try_into().unwrap());
-            let diff = (chunk | case_bit) ^ mask;
-            let zero_mask = diff.wrapping_sub(ones) & !diff & highs;
-            if zero_mask != 0 {
-                let offset = if cfg!(target_endian = "little") {
-                    (zero_mask.trailing_zeros() / 8) as usize
-                } else {
-                    (zero_mask.leading_zeros() / 8) as usize
-                };
-                return Some(i + offset);
-            }
-            i += 8;
-        }
-        while i <= limit {
-            if (haystack[i] | 0x20) == first_lower {
-                return Some(i);
-            }
-            i += 1;
-        }
-    } else {
-        let mask = u64::from_ne_bytes([first_lower; 8]);
-        let ones = u64::from_ne_bytes([0x01; 8]);
-        let highs = u64::from_ne_bytes([0x80; 8]);
-        while i + 8 <= limit + 1 {
-            let chunk = u64::from_ne_bytes(haystack[i..i + 8].try_into().unwrap());
-            let diff = chunk ^ mask;
-            let zero_mask = diff.wrapping_sub(ones) & !diff & highs;
-            if zero_mask != 0 {
-                let offset = if cfg!(target_endian = "little") {
-                    (zero_mask.trailing_zeros() / 8) as usize
-                } else {
-                    (zero_mask.leading_zeros() / 8) as usize
-                };
-                return Some(i + offset);
-            }
-            i += 8;
-        }
-        while i <= limit {
-            if haystack[i] == first_lower {
-                return Some(i);
-            }
-            i += 1;
-        }
-    }
-    None
-}
-
-#[inline]
 fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
     let h = haystack.as_bytes();
     let n = needle.as_bytes();
@@ -332,22 +248,23 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
     }
     let first_lower = first.to_ascii_lowercase();
     let first_upper = first.to_ascii_uppercase();
-    let last_lower = n[len - 1].to_ascii_lowercase();
-    let last_upper = n[len - 1].to_ascii_uppercase();
-    let mid = if len > 2 { &n[1..len - 1] } else { &[][..] };
+    let last = n[len - 1];
+    let last_lower = last.to_ascii_lowercase();
+    let last_upper = last.to_ascii_uppercase();
     let limit = h.len() - len;
-    let mut i = 0;
-    while let Some(pos) = find_ascii_case_insensitive_byte(h, i, limit, first_lower, first_upper) {
-        if len == 1 {
-            return true;
-        }
-        let tail = h[pos + len - 1];
-        if (tail == last_lower || tail == last_upper)
-            && (mid.is_empty() || h[pos + 1..pos + len - 1].eq_ignore_ascii_case(mid))
+    for pos in 0..=limit {
+        let b = h[pos];
+        if (b == first_lower || b == first_upper)
+            && (len == 1
+                || ({
+                    let tail = h[pos + len - 1];
+                    (tail == last_lower || tail == last_upper)
+                        && (len == 2
+                            || h[pos + 1..pos + len - 1].eq_ignore_ascii_case(&n[1..len - 1]))
+                }))
         {
             return true;
         }
-        i = pos + 1;
     }
     false
 }
@@ -371,25 +288,24 @@ fn ascii_name_rank(name: &str, query: &str) -> Option<MatchScore> {
     let first_upper = first_lower.to_ascii_uppercase();
     let last_lower = n[len - 1];
     let last_upper = last_lower.to_ascii_uppercase();
-    let mid = if len > 2 { &n[1..len - 1] } else { &[][..] };
     let limit = h.len() - len;
     let mut substring_hit = false;
-    let mut i = 1;
-    while let Some(pos) = find_ascii_case_insensitive_byte(h, i, limit, first_lower, first_upper) {
-        let matched = if len == 1 {
-            true
-        } else {
-            let tail = h[pos + len - 1];
-            (tail == last_lower || tail == last_upper)
-                && (mid.is_empty() || h[pos + 1..pos + len - 1].eq_ignore_ascii_case(mid))
-        };
-        if matched {
-            if !h[pos - 1].is_ascii_alphanumeric() && h[pos].is_ascii_alphanumeric() {
+    for pos in 1..=limit {
+        let b = h[pos];
+        if (b == first_lower || b == first_upper)
+            && (len == 1
+                || ({
+                    let tail = h[pos + len - 1];
+                    (tail == last_lower || tail == last_upper)
+                        && (len == 2
+                            || h[pos + 1..pos + len - 1].eq_ignore_ascii_case(&n[1..len - 1]))
+                }))
+        {
+            if !h[pos - 1].is_ascii_alphanumeric() && n.iter().all(u8::is_ascii_alphanumeric) {
                 return Some(MatchScore(2));
             }
             substring_hit = true;
         }
-        i = pos + 1;
     }
     substring_hit.then_some(MatchScore(3))
 }
@@ -437,7 +353,6 @@ fn field_contains(raw: &str, query: &str, query_is_ascii: bool) -> bool {
         raw.to_lowercase().contains(query)
     }
 }
-
 fn unique<'a, T: Candidate>(query: &str, items: &'a [T]) -> Result<&'a T, MatchError> {
     let query = query.trim();
     let matches = matches(query, items);
@@ -1048,6 +963,29 @@ mod tests {
             super::cmp_case_insensitive("hr-prod", None, "HR_Prod", None),
             std::cmp::Ordering::Less
         );
+        assert!(super::ascii_contains_ignore_case(
+            "p_payments_12345678",
+            "pay"
+        ));
+        assert!(!super::ascii_contains_ignore_case("@_alpha_12345678", "`"));
+        assert!(!super::ascii_contains_ignore_case(
+            "[_bracket_12345678",
+            "{"
+        ));
+        assert_eq!(
+            super::ascii_name_rank(" North xpay_prod_12345678", "pay"),
+            Some(super::MatchScore(3))
+        );
+        assert_eq!(
+            super::ascii_name_rank(" North p_pay_prod_12345678", "pay"),
+            Some(super::MatchScore(2))
+        );
+        // Query containing punctuation (`"p_p"` or `"-prod"`) cannot match a word prefix
+        // (`split(!is_alphanumeric)` yields alphanumeric words only), so it must score 3 (substring), not 2!
+        assert_eq!(
+            super::ascii_name_rank("North p_pay", "p_p"),
+            Some(super::MatchScore(3))
+        );
     }
 
     #[test]
@@ -1158,6 +1096,16 @@ mod tests {
                 false,
             ),
         ];
+        subscriptions.push(subscription(
+            "North hr_prod",
+            "00000000-0000-0000-0000-000000000012",
+            false,
+        ));
+        subscriptions.push(subscription(
+            "East_hr_prod",
+            "00000000-0000-0000-0000-000000000013",
+            false,
+        ));
         subscriptions[4].tenant_id = "TENANT-ZAŻÓŁĆ-01".to_owned();
         subscriptions[0].tenant_id = "TENANT-SHARED-99".to_owned();
 
@@ -1167,6 +1115,9 @@ mod tests {
             "hr",
             "HR_PROD",
             "archive",
+            "hr_p",
+            "-prod",
+            "[archive",
             "z",
             "zażółć",
             "ZAŻÓŁĆ",
