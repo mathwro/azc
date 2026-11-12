@@ -1,6 +1,6 @@
 use std::{
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::{self, BufReader, BufWriter, Write},
@@ -31,7 +31,7 @@ pub struct Snapshot {
 }
 
 impl Cache {
-    pub fn from_env() -> Option<Self> {
+    pub fn for_azure(executable: &OsStr) -> Option<Self> {
         let directory = env::var_os("AZURE_CONFIG_DIR")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
@@ -39,16 +39,13 @@ impl Cache {
                 let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
                 env::var_os(home).map(|home| PathBuf::from(home).join(".azure"))
             })?;
-        Some(Self::new(
-            directory,
-            env::var_os("AZC_AZ_BIN").unwrap_or_else(default_executable),
-        ))
+        Some(Self::new(directory, executable))
     }
 
-    fn new(directory: PathBuf, executable: OsString) -> Self {
+    fn new(directory: PathBuf, executable: &OsStr) -> Self {
         Self {
             directory,
-            source: encode_source(&executable),
+            source: encode_source(executable),
         }
     }
 
@@ -139,49 +136,14 @@ fn encode_source(executable: &OsStr) -> String {
         }
         encoded
     }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        format!("lossy:{}", executable.to_string_lossy())
-    }
-}
-
-fn default_executable() -> OsString {
-    #[cfg(target_os = "windows")]
-    {
-        windows_default_executable(env::var_os("PATH").as_deref())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        OsString::from("az")
-    }
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_default_executable(path: Option<&OsStr>) -> OsString {
-    if let Some(path) = path {
-        for directory in env::split_paths(path) {
-            if directory.as_os_str().is_empty() {
-                continue;
-            }
-            for file_name in ["az.exe", "az.cmd", "az.bat"] {
-                let candidate = directory.join(file_name);
-                if candidate.is_file() {
-                    return candidate.into_os_string();
-                }
-            }
-        }
-    }
-    OsString::from("az.cmd")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cache, windows_default_executable};
+    use super::Cache;
     use crate::model::{Subscription, TenantDescription};
     use std::{
-        ffi::OsString,
+        ffi::OsStr,
         fs,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -217,7 +179,7 @@ mod tests {
     #[test]
     fn persists_subscription_ids_and_tenant_labels_for_next_run() {
         let directory = Directory::new();
-        let cache = Cache::new(directory.0.clone(), OsString::from("az"));
+        let cache = Cache::new(directory.0.clone(), OsStr::new("az"));
         cache.save(&subscriptions(), &descriptions()).unwrap();
         let restored = cache.load().unwrap();
         assert_eq!(restored.subscriptions[1].id, "beta");
@@ -231,7 +193,7 @@ mod tests {
     #[test]
     fn ignores_expired_future_corrupt_and_incompatible_snapshots() {
         let directory = Directory::new();
-        let cache = Cache::new(directory.0.clone(), OsString::from("az"));
+        let cache = Cache::new(directory.0.clone(), OsStr::new("az"));
         assert!(cache.load().is_none());
         cache.save(&subscriptions(), &descriptions()).unwrap();
         let path = directory.0.join("azc-picker-cache.json");
@@ -263,15 +225,15 @@ mod tests {
     fn isolates_azure_configurations_and_executable_overrides() {
         let first = Directory::new();
         let second = Directory::new();
-        let cache = Cache::new(first.0.clone(), OsString::from("az"));
+        let cache = Cache::new(first.0.clone(), OsStr::new("az"));
         cache.save(&subscriptions(), &descriptions()).unwrap();
         assert!(
-            Cache::new(second.0.clone(), OsString::from("az"))
+            Cache::new(second.0.clone(), OsStr::new("az"))
                 .load()
                 .is_none()
         );
         assert!(
-            Cache::new(first.0.clone(), OsString::from("different-az"))
+            Cache::new(first.0.clone(), OsStr::new("different-az"))
                 .load()
                 .is_none()
         );
@@ -280,7 +242,7 @@ mod tests {
     #[test]
     fn failed_write_preserves_previous_snapshot() {
         let directory = Directory::new();
-        let cache = Cache::new(directory.0.clone(), OsString::from("az"));
+        let cache = Cache::new(directory.0.clone(), OsStr::new("az"));
         cache.save(&subscriptions(), &descriptions()).unwrap();
         // Blocking the staging path must not truncate the usable cache.
         fs::create_dir(
@@ -296,7 +258,7 @@ mod tests {
     #[test]
     fn stores_deterministic_string_source_and_distinguishes_non_utf8_executables() {
         let directory = Directory::new();
-        let cache = Cache::new(directory.0.clone(), OsString::from("/opt/az/bin/az"));
+        let cache = Cache::new(directory.0.clone(), OsStr::new("/opt/az/bin/az"));
         cache.save(&subscriptions(), &descriptions()).unwrap();
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.0.join("azc-picker-cache.json")).unwrap())
@@ -306,17 +268,14 @@ mod tests {
 
         let forged = Cache::new(
             directory.0.clone(),
-            OsString::from("bytes:2f6f70742f617a2f62696e2f617a"),
+            OsStr::new("bytes:2f6f70742f617a2f62696e2f617a"),
         );
         assert!(forged.load().is_none());
 
         #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStringExt;
-            let first = Cache::new(
-                directory.0.clone(),
-                OsString::from_vec(vec![b'a', b'z', 0xfe]),
-            );
+            use std::os::unix::ffi::OsStrExt;
+            let first = Cache::new(directory.0.clone(), OsStr::from_bytes(&[b'a', b'z', 0xfe]));
             first.save(&subscriptions(), &descriptions()).unwrap();
             let raw_bytes: serde_json::Value = serde_json::from_slice(
                 &fs::read(directory.0.join("azc-picker-cache.json")).unwrap(),
@@ -325,47 +284,8 @@ mod tests {
             assert_eq!(raw_bytes["source"], "bytes:617afe");
             assert!(first.load().is_some());
 
-            let second = Cache::new(
-                directory.0.clone(),
-                OsString::from_vec(vec![b'a', b'z', 0xff]),
-            );
+            let second = Cache::new(directory.0.clone(), OsStr::from_bytes(&[b'a', b'z', 0xff]));
             assert!(second.load().is_none());
         }
-    }
-
-    #[test]
-    fn resolves_windows_default_executable_from_non_empty_path_entries() {
-        let first = Directory::new();
-        let second = Directory::new();
-        let bat = second.0.join("az.bat");
-        fs::write(&bat, b"@echo off\r\n").unwrap();
-
-        let path =
-            std::env::join_paths([PathBuf::new(), first.0.clone(), second.0.clone()]).unwrap();
-        assert_eq!(
-            windows_default_executable(Some(&path)),
-            bat.into_os_string()
-        );
-
-        let cmd = second.0.join("az.cmd");
-        fs::write(&cmd, b"@echo off\r\n").unwrap();
-        assert_eq!(
-            windows_default_executable(Some(&path)),
-            cmd.into_os_string()
-        );
-
-        let exe = first.0.join("az.exe");
-        fs::write(&exe, b"MZ").unwrap();
-        assert_eq!(
-            windows_default_executable(Some(&path)),
-            exe.into_os_string()
-        );
-
-        let empty_only = std::env::join_paths([PathBuf::new()]).unwrap();
-        assert_eq!(
-            windows_default_executable(Some(&empty_only)),
-            OsString::from("az.cmd")
-        );
-        assert_eq!(windows_default_executable(None), OsString::from("az.cmd"));
     }
 }

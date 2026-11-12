@@ -132,7 +132,7 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
     if refresh && sender.send(LoadedAccounts::RefreshStarted).is_err() {
         return false;
     }
-    let cache = Cache::from_env();
+    let cache = Cache::for_azure(azure.executable());
     let mut previous_descriptions = Vec::new();
     if !refresh && let Some(snapshot) = cache.as_ref().and_then(Cache::load) {
         previous_descriptions.clone_from(&snapshot.descriptions);
@@ -408,12 +408,9 @@ impl App {
         if self.has_accounts {
             let selected = if self.tenant_mode {
                 selected_tenant_id.and_then(|id| {
-                    self.filtered.iter().position(|&index| {
-                        self.tenants[index]
-                            .id
-                            .trim()
-                            .eq_ignore_ascii_case(id.trim())
-                    })
+                    self.filtered
+                        .iter()
+                        .position(|&index| self.tenants[index].id.eq_ignore_ascii_case(id))
                 })
             } else {
                 selected_id.and_then(|id| {
@@ -510,7 +507,7 @@ impl App {
             KeyCode::Esc => Some(Action::Cancel),
             KeyCode::Enter if self.selected().is_some() => {
                 if self.tenant_mode && self.shortlist.is_none() {
-                    self.tenant_scope = Some(self.selected()?.tenant_id.clone());
+                    self.tenant_scope = Some(self.selected()?.tenant_id.trim().to_owned());
                     self.tenant_mode = false;
                     self.query.clear();
                     self.refresh_filter();
@@ -582,7 +579,7 @@ impl App {
                     self.subscriptions[index]
                         .tenant_id
                         .trim()
-                        .eq_ignore_ascii_case(tenant_id.trim())
+                        .eq_ignore_ascii_case(tenant_id)
                 });
             }
             indices
@@ -785,7 +782,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let label = app
             .tenants
             .iter()
-            .find(|tenant| tenant.id.trim().eq_ignore_ascii_case(id.trim()))
+            .find(|tenant| tenant.id.eq_ignore_ascii_case(id))
             .map_or_else(|| id.to_owned(), Tenant::label);
         format!("Subscriptions in {label}")
     } else {
@@ -819,7 +816,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         } else if let Some(id) = tenant_scope {
             app.tenants
                 .iter()
-                .find(|tenant| tenant.id.trim().eq_ignore_ascii_case(id.trim()))
+                .find(|tenant| tenant.id.eq_ignore_ascii_case(id))
                 .map_or(0, |tenant| tenant.subscription_count)
         } else {
             app.subscriptions.len()
@@ -947,16 +944,24 @@ fn trailing_width(text: &str, max_width: usize) -> String {
 }
 
 fn format_single_line(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            line.split(|character: char| character.is_whitespace() || character.is_control())
-                .filter(|word| !word.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" — ")
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let mut words = line
+            .split(|character: char| character.is_whitespace() || character.is_control())
+            .filter(|word| !word.is_empty());
+        let Some(first) = words.next() else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push_str(" — ");
+        }
+        out.push_str(first);
+        for word in words {
+            out.push(' ');
+            out.push_str(word);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
