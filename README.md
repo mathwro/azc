@@ -278,6 +278,12 @@ cargo check --target x86_64-pc-windows-gnu
 cargo check --target x86_64-apple-darwin
 ```
 
+Run the dependency-free release benchmarks locally when changing matching, tenant grouping, background loading, or TUI rendering:
+
+```sh
+cargo test --release --locked -- --ignored --nocapture --test-threads=1
+```
+
 The project-specific contribution and verification contracts are in [`AGENTS.md`](AGENTS.md).
 
 ## Releasing
