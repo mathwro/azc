@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{cmp::Ordering, error::Error, fmt};
 
 use crate::model::{Subscription, Tenant};
 
@@ -12,9 +12,14 @@ trait Candidate {
 
     /// Display name and current flag used to break score ties.
     fn tie_break(&self) -> (&str, bool);
-    /// Scores a candidate against a pre-lowercased query and lowercased name.
-    fn score(&self, query: &str, fragments: &[&str], name_lower: &str) -> Option<MatchScore>;
-    /// Label listed in ambiguity errors.
+    /// Scores a candidate against a pre-lowercased query; `name_lower` is `Some` iff `!name.is_ascii()`.
+    fn score(
+        &self,
+        query: &str,
+        query_is_ascii: bool,
+        fragments: &[&str],
+        name_lower: Option<&str>,
+    ) -> Option<MatchScore>;
     fn describe(&self) -> String;
 }
 
@@ -25,8 +30,14 @@ impl Candidate for Subscription {
         (&self.name, self.is_default)
     }
 
-    fn score(&self, query: &str, fragments: &[&str], name_lower: &str) -> Option<MatchScore> {
-        score(query, fragments, name_lower, self)
+    fn score(
+        &self,
+        query: &str,
+        query_is_ascii: bool,
+        fragments: &[&str],
+        name_lower: Option<&str>,
+    ) -> Option<MatchScore> {
+        score(query, query_is_ascii, fragments, name_lower, self)
     }
 
     fn describe(&self) -> String {
@@ -41,8 +52,14 @@ impl Candidate for Tenant {
         (&self.name, self.is_current)
     }
 
-    fn score(&self, query: &str, fragments: &[&str], name_lower: &str) -> Option<MatchScore> {
-        score_tenant(query, fragments, name_lower, self)
+    fn score(
+        &self,
+        query: &str,
+        query_is_ascii: bool,
+        fragments: &[&str],
+        name_lower: Option<&str>,
+    ) -> Option<MatchScore> {
+        score_tenant(query, query_is_ascii, fragments, name_lower, self)
     }
 
     fn describe(&self) -> String {
@@ -86,27 +103,339 @@ fn ranked<T: Candidate>(query: &str, items: &[T]) -> Vec<usize> {
 
 /// Orders matches by score, current item first, case-insensitive name, then source order.
 fn matches<T: Candidate>(query: &str, items: &[T]) -> Vec<(usize, MatchScore)> {
-    let query = query.trim().to_lowercase();
-    let fragments = name_fragments(&query);
-    let mut matches = items
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            let (name, is_current) = item.tie_break();
-            let name_lower = name.to_lowercase();
-            let score = if query.is_empty() {
-                MatchScore(u8::from(!is_current))
-            } else {
-                item.score(&query, &fragments, &name_lower)?
-            };
-            Some((score, !is_current, name_lower, index))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_unstable();
-    matches
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return empty_query_matches(items);
+    }
+    matches_non_empty(trimmed, items)
+}
+
+fn matches_non_empty<T: Candidate>(trimmed: &str, items: &[T]) -> Vec<(usize, MatchScore)> {
+    let mut query_stack = [0u8; 256];
+    let query_heap: String;
+    let (query, query_is_ascii) = if trimmed.is_ascii() && trimmed.len() <= query_stack.len() {
+        let bytes = trimmed.as_bytes();
+        for (dst, &src) in query_stack[..bytes.len()].iter_mut().zip(bytes) {
+            *dst = src.to_ascii_lowercase();
+        }
+        (
+            std::str::from_utf8(&query_stack[..bytes.len()]).expect("ASCII bytes are valid UTF-8"),
+            true,
+        )
+    } else {
+        query_heap = trimmed.to_lowercase();
+        let is_ascii = query_heap.is_ascii();
+        (query_heap.as_str(), is_ascii)
+    };
+
+    let mut frag_buf = [""; 8];
+    let mut frag_vec = Vec::new();
+    let fragments = fill_name_fragments(query, &mut frag_buf, &mut frag_vec);
+
+    let mut entries = Vec::new();
+    let mut unicode_names: Vec<(usize, String)> = Vec::new();
+
+    for (index, item) in items.iter().enumerate() {
+        let (name, is_current) = item.tie_break();
+        if name.is_ascii() {
+            if let Some(score) = item.score(query, query_is_ascii, fragments, None) {
+                entries.push((score, !is_current, name, index));
+            }
+        } else {
+            let lower = name.to_lowercase();
+            if let Some(score) = item.score(query, query_is_ascii, fragments, Some(&lower)) {
+                entries.push((score, !is_current, name, index));
+                unicode_names.push((index, lower));
+            }
+        }
+    }
+
+    sort_match_entries(&mut entries, &unicode_names);
+    entries
         .into_iter()
         .map(|(score, _, _, index)| (index, score))
         .collect()
+}
+
+fn empty_query_matches<T: Candidate>(items: &[T]) -> Vec<(usize, MatchScore)> {
+    let mut entries = Vec::with_capacity(items.len());
+    let mut unicode_names: Vec<(usize, String)> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let (name, is_current) = item.tie_break();
+        if !name.is_ascii() {
+            unicode_names.push((index, name.to_lowercase()));
+        }
+        entries.push((MatchScore(u8::from(!is_current)), !is_current, name, index));
+    }
+    sort_match_entries(&mut entries, &unicode_names);
+    entries
+        .into_iter()
+        .map(|(score, _, _, index)| (index, score))
+        .collect()
+}
+
+fn sort_match_entries(
+    entries: &mut [(MatchScore, bool, &str, usize)],
+    unicode_names: &[(usize, String)],
+) {
+    if unicode_names.is_empty() {
+        entries.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| cmp_ascii_ignore_case(a.2.as_bytes(), b.2.as_bytes()))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+    } else {
+        let lookup = |idx: usize| -> Option<&str> {
+            unicode_names
+                .binary_search_by_key(&idx, |&(i, _)| i)
+                .ok()
+                .map(|pos| unicode_names[pos].1.as_str())
+        };
+        entries.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| cmp_case_insensitive(a.2, lookup(a.3), b.2, lookup(b.3)))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+    }
+}
+#[inline]
+fn cmp_ascii_ignore_case(a: &[u8], b: &[u8]) -> Ordering {
+    let common = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= common {
+        let wa = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
+        let wb = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
+        if wa == wb {
+            i += 8;
+            continue;
+        }
+        break;
+    }
+    while i < common {
+        let ca = a[i];
+        let cb = b[i];
+        if ca != cb {
+            let la = ca.to_ascii_lowercase();
+            let lb = cb.to_ascii_lowercase();
+            if la != lb {
+                return la.cmp(&lb);
+            }
+        }
+        i += 1;
+    }
+    a.len().cmp(&b.len())
+}
+
+#[inline]
+fn cmp_case_insensitive(
+    a: &str,
+    a_lower: Option<&str>,
+    b: &str,
+    b_lower: Option<&str>,
+) -> Ordering {
+    match (a_lower, b_lower) {
+        (None, None) => cmp_ascii_ignore_case(a.as_bytes(), b.as_bytes()),
+        (Some(al), None) => al
+            .bytes()
+            .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase())),
+        (None, Some(bl)) => a
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(bl.bytes()),
+        (Some(al), Some(bl)) => al.cmp(bl),
+    }
+}
+
+#[inline]
+fn ascii_starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .get(..needle.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[inline]
+fn find_ascii_case_insensitive_byte(
+    haystack: &[u8],
+    mut i: usize,
+    limit: usize,
+    first_lower: u8,
+    first_upper: u8,
+) -> Option<usize> {
+    if first_lower != first_upper {
+        // `first_lower` is `'a'..='z'` (`0x61..=0x7A`); for ASCII `b`, `(b | 0x20) == first_lower`
+        // holds iff `b == first_lower || b == first_upper`.
+        let mask = u64::from_ne_bytes([first_lower; 8]);
+        let case_bit = u64::from_ne_bytes([0x20; 8]);
+        let ones = u64::from_ne_bytes([0x01; 8]);
+        let highs = u64::from_ne_bytes([0x80; 8]);
+        while i + 8 <= limit + 1 {
+            let chunk = u64::from_ne_bytes(haystack[i..i + 8].try_into().unwrap());
+            let diff = (chunk | case_bit) ^ mask;
+            let zero_mask = diff.wrapping_sub(ones) & !diff & highs;
+            if zero_mask != 0 {
+                let offset = if cfg!(target_endian = "little") {
+                    (zero_mask.trailing_zeros() / 8) as usize
+                } else {
+                    (zero_mask.leading_zeros() / 8) as usize
+                };
+                return Some(i + offset);
+            }
+            i += 8;
+        }
+        while i <= limit {
+            if (haystack[i] | 0x20) == first_lower {
+                return Some(i);
+            }
+            i += 1;
+        }
+    } else {
+        let mask = u64::from_ne_bytes([first_lower; 8]);
+        let ones = u64::from_ne_bytes([0x01; 8]);
+        let highs = u64::from_ne_bytes([0x80; 8]);
+        while i + 8 <= limit + 1 {
+            let chunk = u64::from_ne_bytes(haystack[i..i + 8].try_into().unwrap());
+            let diff = chunk ^ mask;
+            let zero_mask = diff.wrapping_sub(ones) & !diff & highs;
+            if zero_mask != 0 {
+                let offset = if cfg!(target_endian = "little") {
+                    (zero_mask.trailing_zeros() / 8) as usize
+                } else {
+                    (zero_mask.leading_zeros() / 8) as usize
+                };
+                return Some(i + offset);
+            }
+            i += 8;
+        }
+        while i <= limit {
+            if haystack[i] == first_lower {
+                return Some(i);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+#[inline]
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    let Some(&first) = n.first() else {
+        return true;
+    };
+    let len = n.len();
+    if h.len() < len {
+        return false;
+    }
+    let first_lower = first.to_ascii_lowercase();
+    let first_upper = first.to_ascii_uppercase();
+    let last_lower = n[len - 1].to_ascii_lowercase();
+    let last_upper = n[len - 1].to_ascii_uppercase();
+    let mid = if len > 2 { &n[1..len - 1] } else { &[][..] };
+    let limit = h.len() - len;
+    let mut i = 0;
+    while let Some(pos) = find_ascii_case_insensitive_byte(h, i, limit, first_lower, first_upper) {
+        if len == 1 {
+            return true;
+        }
+        let tail = h[pos + len - 1];
+        if (tail == last_lower || tail == last_upper)
+            && (mid.is_empty() || h[pos + 1..pos + len - 1].eq_ignore_ascii_case(mid))
+        {
+            return true;
+        }
+        i = pos + 1;
+    }
+    false
+}
+
+#[inline]
+fn ascii_name_rank(name: &str, query: &str) -> Option<MatchScore> {
+    let h = name.as_bytes();
+    let n = query.as_bytes();
+    let len = n.len();
+    if h.len() < len {
+        return None;
+    }
+    if h[..len].eq_ignore_ascii_case(n) {
+        return Some(if h.len() == len {
+            MatchScore(0)
+        } else {
+            MatchScore(1)
+        });
+    }
+    let first_lower = n[0];
+    let first_upper = first_lower.to_ascii_uppercase();
+    let last_lower = n[len - 1];
+    let last_upper = last_lower.to_ascii_uppercase();
+    let mid = if len > 2 { &n[1..len - 1] } else { &[][..] };
+    let limit = h.len() - len;
+    let mut substring_hit = false;
+    let mut i = 1;
+    while let Some(pos) = find_ascii_case_insensitive_byte(h, i, limit, first_lower, first_upper) {
+        let matched = if len == 1 {
+            true
+        } else {
+            let tail = h[pos + len - 1];
+            (tail == last_lower || tail == last_upper)
+                && (mid.is_empty() || h[pos + 1..pos + len - 1].eq_ignore_ascii_case(mid))
+        };
+        if matched {
+            if !h[pos - 1].is_ascii_alphanumeric() && h[pos].is_ascii_alphanumeric() {
+                return Some(MatchScore(2));
+            }
+            substring_hit = true;
+        }
+        i = pos + 1;
+    }
+    substring_hit.then_some(MatchScore(3))
+}
+
+enum Field<'a> {
+    Ascii(&'a str),
+    Lower(String),
+}
+
+impl<'a> Field<'a> {
+    fn new(raw: &'a str, query_is_ascii: bool) -> Self {
+        if query_is_ascii && raw.is_ascii() {
+            Self::Ascii(raw)
+        } else {
+            Self::Lower(raw.to_lowercase())
+        }
+    }
+
+    fn eq_query(&self, query: &str) -> bool {
+        match self {
+            Self::Ascii(s) => s.eq_ignore_ascii_case(query),
+            Self::Lower(s) => s == query,
+        }
+    }
+
+    fn starts_with_query(&self, query: &str) -> bool {
+        match self {
+            Self::Ascii(s) => ascii_starts_with_ignore_case(s, query),
+            Self::Lower(s) => s.starts_with(query),
+        }
+    }
+
+    fn contains_query(&self, query: &str) -> bool {
+        match self {
+            Self::Ascii(s) => ascii_contains_ignore_case(s, query),
+            Self::Lower(s) => s.contains(query),
+        }
+    }
+}
+
+fn field_contains(raw: &str, query: &str, query_is_ascii: bool) -> bool {
+    if query_is_ascii && raw.is_ascii() {
+        ascii_contains_ignore_case(raw, query)
+    } else {
+        raw.to_lowercase().contains(query)
+    }
 }
 
 fn unique<'a, T: Candidate>(query: &str, items: &'a [T]) -> Result<&'a T, MatchError> {
@@ -135,29 +464,91 @@ fn unique<'a, T: Candidate>(query: &str, items: &'a [T]) -> Result<&'a T, MatchE
 
 fn score_tenant(
     query: &str,
+    query_is_ascii: bool,
     fragments: &[&str],
-    name: &str,
+    name_lower: Option<&str>,
     tenant: &Tenant,
 ) -> Option<MatchScore> {
-    if name == query {
+    let name_eq = match name_lower {
+        None if query_is_ascii => tenant.name.eq_ignore_ascii_case(query),
+        None => false,
+        Some(n) => n == query,
+    };
+    if name_eq {
         return Some(MatchScore(0));
     }
 
-    let id = tenant.id.to_lowercase();
-    let domain = tenant.default_domain.to_lowercase();
-    if domain == query || id == query {
-        Some(MatchScore(0))
-    } else if name.starts_with(query) || domain.starts_with(query) || id.starts_with(query) {
-        Some(MatchScore(1))
-    } else if name.contains(query) || domain.contains(query) || id.contains(query) {
+    let id = Field::new(&tenant.id, query_is_ascii);
+    let domain = Field::new(&tenant.default_domain, query_is_ascii);
+    if domain.eq_query(query) || id.eq_query(query) {
+        return Some(MatchScore(0));
+    }
+
+    let name_starts = match name_lower {
+        None if query_is_ascii => ascii_starts_with_ignore_case(&tenant.name, query),
+        None => false,
+        Some(n) => n.starts_with(query),
+    };
+    if name_starts || domain.starts_with_query(query) || id.starts_with_query(query) {
+        return Some(MatchScore(1));
+    }
+
+    let name_contains = match name_lower {
+        None if query_is_ascii => ascii_contains_ignore_case(&tenant.name, query),
+        None => false,
+        Some(n) => n.contains(query),
+    };
+    if name_contains || domain.contains_query(query) || id.contains_query(query) {
         Some(MatchScore(2))
-    } else if !fragments.is_empty() && fragments.iter().all(|fragment| name.contains(*fragment)) {
+    } else if !fragments.is_empty()
+        && match name_lower {
+            None if query_is_ascii => fragments
+                .iter()
+                .all(|fragment| ascii_contains_ignore_case(&tenant.name, fragment)),
+            None => false,
+            Some(n) => fragments.iter().all(|fragment| n.contains(*fragment)),
+        }
+    {
         Some(MatchScore(3))
     } else {
         None
     }
 }
 
+fn fill_name_fragments<'q, 'b>(
+    query: &'q str,
+    buf: &'b mut [&'q str; 8],
+    overflow: &'b mut Vec<&'q str>,
+) -> &'b [&'q str] {
+    let mut iter = query.split_whitespace();
+    let Some(first) = iter.next() else {
+        return &[];
+    };
+    let Some(second) = iter.next() else {
+        return &[];
+    };
+    buf[0] = first;
+    buf[1] = second;
+    let mut count = 2;
+    for term in iter {
+        if count < buf.len() {
+            buf[count] = term;
+            count += 1;
+        } else {
+            if overflow.is_empty() {
+                overflow.extend_from_slice(buf);
+            }
+            overflow.push(term);
+        }
+    }
+    if overflow.is_empty() {
+        &buf[..count]
+    } else {
+        overflow.as_slice()
+    }
+}
+
+#[cfg(test)]
 fn name_fragments(query: &str) -> Vec<&str> {
     let mut fragments = query.split_whitespace();
     let Some(first) = fragments.next() else {
@@ -173,32 +564,92 @@ fn name_fragments(query: &str) -> Vec<&str> {
 
 fn score(
     query: &str,
+    query_is_ascii: bool,
     fragments: &[&str],
-    name: &str,
+    name_lower: Option<&str>,
     subscription: &Subscription,
 ) -> Option<MatchScore> {
-    if name == query {
-        return Some(MatchScore(0));
-    }
-
-    let id = subscription.id.to_lowercase();
-    if id == query {
-        Some(MatchScore(0))
-    } else if name.starts_with(query) {
-        Some(MatchScore(1))
-    } else if name
-        .split(|character: char| !character.is_alphanumeric())
-        .any(|word| word.starts_with(query))
-    {
-        Some(MatchScore(2))
-    } else if name.contains(query) {
-        Some(MatchScore(3))
-    } else if id.contains(query) || subscription.tenant_id.to_lowercase().contains(query) {
-        Some(MatchScore(4))
-    } else if !fragments.is_empty() && fragments.iter().all(|fragment| name.contains(*fragment)) {
-        Some(MatchScore(5))
-    } else {
-        None
+    match name_lower {
+        None => {
+            if query_is_ascii {
+                let name_rank = ascii_name_rank(&subscription.name, query);
+                if name_rank == Some(MatchScore(0)) {
+                    return name_rank;
+                }
+                let id_is_ascii = subscription.id.is_ascii();
+                if id_is_ascii {
+                    if subscription.id.len() == query.len()
+                        && subscription.id.eq_ignore_ascii_case(query)
+                    {
+                        return Some(MatchScore(0));
+                    }
+                } else if subscription.id.to_lowercase() == query {
+                    return Some(MatchScore(0));
+                }
+                if let Some(rank) = name_rank {
+                    return Some(rank);
+                }
+                let id_contains = if id_is_ascii {
+                    ascii_contains_ignore_case(&subscription.id, query)
+                } else {
+                    subscription.id.to_lowercase().contains(query)
+                };
+                if id_contains || field_contains(&subscription.tenant_id, query, true) {
+                    Some(MatchScore(4))
+                } else if !fragments.is_empty()
+                    && fragments
+                        .iter()
+                        .all(|fragment| ascii_contains_ignore_case(&subscription.name, fragment))
+                {
+                    Some(MatchScore(5))
+                } else {
+                    None
+                }
+            } else if !subscription.id.is_ascii() {
+                let id_lower = subscription.id.to_lowercase();
+                if id_lower == query {
+                    Some(MatchScore(0))
+                } else if id_lower.contains(query)
+                    || field_contains(&subscription.tenant_id, query, false)
+                {
+                    Some(MatchScore(4))
+                } else {
+                    None
+                }
+            } else if field_contains(&subscription.tenant_id, query, false) {
+                Some(MatchScore(4))
+            } else {
+                None
+            }
+        }
+        Some(name) => {
+            if name == query {
+                return Some(MatchScore(0));
+            }
+            let id = Field::new(&subscription.id, query_is_ascii);
+            if id.eq_query(query) {
+                Some(MatchScore(0))
+            } else if name.starts_with(query) {
+                Some(MatchScore(1))
+            } else if name
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|word| word.starts_with(query))
+            {
+                Some(MatchScore(2))
+            } else if name.contains(query) {
+                Some(MatchScore(3))
+            } else if id.contains_query(query)
+                || field_contains(&subscription.tenant_id, query, query_is_ascii)
+            {
+                Some(MatchScore(4))
+            } else if !fragments.is_empty()
+                && fragments.iter().all(|fragment| name.contains(*fragment))
+            {
+                Some(MatchScore(5))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -577,8 +1028,306 @@ mod tests {
         assert_eq!(ranked_indices("", &subscriptions), [1, 0, 2]);
 
         assert_eq!(
-            super::Candidate::score(&subscriptions[0], "zażółć", &[], "zażółć dev"),
+            super::Candidate::score(&subscriptions[0], "zażółć", false, &[], Some("zażółć dev")),
             Some(super::MatchScore(1))
         );
+    }
+    #[test]
+    fn ascii_case_insensitive_helpers_match_without_heap_allocations() {
+        assert!(super::ascii_starts_with_ignore_case("HR Production", "hr"));
+        assert!(super::ascii_starts_with_ignore_case("HR Production", ""));
+        assert!(!super::ascii_starts_with_ignore_case("HR", "hr prod"));
+        assert!(super::ascii_contains_ignore_case("North-HR_Prod", "hr_p"));
+        assert!(super::ascii_contains_ignore_case("North", ""));
+        assert!(!super::ascii_contains_ignore_case("HR", "hr_p"));
+        assert_eq!(
+            super::cmp_case_insensitive("HR_Prod", None, "hra", None),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            super::cmp_case_insensitive("hr-prod", None, "HR_Prod", None),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn matches_reference_lowercase_oracle_across_punctuation_and_mixed_unicode() {
+        fn reference_ranked_subscriptions(
+            query: &str,
+            subscriptions: &[Subscription],
+        ) -> Vec<usize> {
+            let query = query.trim().to_lowercase();
+            let fragments = super::name_fragments(&query);
+            let mut out = subscriptions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, sub)| {
+                    let name_lower = sub.name.to_lowercase();
+                    let id = sub.id.to_lowercase();
+                    let score = if query.is_empty() {
+                        u8::from(!sub.is_default)
+                    } else if name_lower == query || id == query {
+                        0
+                    } else if name_lower.starts_with(&query) {
+                        1
+                    } else if name_lower
+                        .split(|c: char| !c.is_alphanumeric())
+                        .any(|w| w.starts_with(&query))
+                    {
+                        2
+                    } else if name_lower.contains(&query) {
+                        3
+                    } else if id.contains(&query) || sub.tenant_id.to_lowercase().contains(&query) {
+                        4
+                    } else if !fragments.is_empty()
+                        && fragments.iter().all(|f| name_lower.contains(*f))
+                    {
+                        5
+                    } else {
+                        return None;
+                    };
+                    Some((score, !sub.is_default, name_lower, index))
+                })
+                .collect::<Vec<_>>();
+            out.sort_unstable();
+            out.into_iter().map(|(_, _, _, i)| i).collect()
+        }
+
+        fn reference_ranked_tenants(query: &str, tenants: &[Tenant]) -> Vec<usize> {
+            let query = query.trim().to_lowercase();
+            let fragments = super::name_fragments(&query);
+            let mut out = tenants
+                .iter()
+                .enumerate()
+                .filter_map(|(index, t)| {
+                    let name = t.name.to_lowercase();
+                    let id = t.id.to_lowercase();
+                    let domain = t.default_domain.to_lowercase();
+                    let score = if query.is_empty() {
+                        u8::from(!t.is_current)
+                    } else if name == query || domain == query || id == query {
+                        0
+                    } else if name.starts_with(&query)
+                        || domain.starts_with(&query)
+                        || id.starts_with(&query)
+                    {
+                        1
+                    } else if name.contains(&query)
+                        || domain.contains(&query)
+                        || id.contains(&query)
+                    {
+                        2
+                    } else if !fragments.is_empty() && fragments.iter().all(|f| name.contains(*f)) {
+                        3
+                    } else {
+                        return None;
+                    };
+                    Some((score, !t.is_current, name, index))
+                })
+                .collect::<Vec<_>>();
+            out.sort_unstable();
+            out.into_iter().map(|(_, _, _, i)| i).collect()
+        }
+
+        let mut subscriptions = vec![
+            subscription("HR_Prod", "ABCDEF01-0000-0000-0000-000000000001", false),
+            subscription("hr-prod", "abcdef01-0000-0000-0000-000000000002", false),
+            subscription("hra", "00000000-0000-0000-0000-000000000003", false),
+            subscription("HR[Archive]", "00000000-0000-0000-0000-000000000004", false),
+            subscription("Zażółć Dev", "00000000-0000-0000-0000-000000000005", false),
+            subscription(
+                "zażółć_alpha",
+                "00000000-0000-0000-0000-000000000006",
+                false,
+            ),
+            subscription("zebra", "00000000-0000-0000-0000-000000000007", false),
+            subscription("Équipe Prod", "00000000-0000-0000-0000-000000000008", true),
+            subscription(
+                "İstanbul Core",
+                "00000000-0000-0000-0000-000000000009",
+                false,
+            ),
+            subscription(
+                "Straße Payments",
+                "00000000-0000-0000-0000-000000000010",
+                false,
+            ),
+            subscription(
+                "North-İstanbul-Prod",
+                "00000000-0000-0000-0000-000000000011",
+                false,
+            ),
+        ];
+        subscriptions[4].tenant_id = "TENANT-ZAŻÓŁĆ-01".to_owned();
+        subscriptions[0].tenant_id = "TENANT-SHARED-99".to_owned();
+
+        let queries = [
+            "",
+            "   ",
+            "hr",
+            "HR_PROD",
+            "archive",
+            "z",
+            "zażółć",
+            "ZAŻÓŁĆ",
+            "équipe",
+            "İSTANBUL",
+            "istanbul",
+            "i\u{307}stanbul",
+            "straße",
+            "STRASSE",
+            "prod north",
+            "payments straße",
+            "abcdef01",
+            "tenant-shared",
+            "tenant-zażółć",
+            "a b c d e f g h i j",
+            "9",
+        ];
+
+        for query in queries {
+            assert_eq!(
+                ranked_indices(query, &subscriptions),
+                reference_ranked_subscriptions(query, &subscriptions),
+                "subscription ranking mismatch for query {query:?}"
+            );
+        }
+
+        let tenants = vec![
+            tenant("HR_Prod", "AAAA-01", "HR_Prod.Contoso.com"),
+            tenant("hr-prod", "aaaa-02", "hr-prod.contoso.com"),
+            tenant("hra", "aaaa-03", "hra.contoso.com"),
+            tenant("Zażółć Corp", "bbbb-01", "zazolc.example.com"),
+            tenant("İstanbul Ops", "cccc-01", "istanbul.example.com"),
+            tenant("zebra", "dddd-01", "zebra.example.com"),
+        ];
+
+        for query in queries {
+            assert_eq!(
+                ranked_tenant_indices(query, &tenants),
+                reference_ranked_tenants(query, &tenants),
+                "tenant ranking mismatch for query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_matcher_keystroke_latency_1000_subscriptions() {
+        use std::{hint::black_box, time::Instant};
+
+        let subscriptions = (0..1_000usize)
+            .map(|i| {
+                let env = ["dev", "staging", "prod", "sandbox"][i % 4];
+                let team = [
+                    "platform",
+                    "identity",
+                    "billing",
+                    "network",
+                    "security",
+                    "data",
+                    "analytics",
+                    "compute",
+                    "storage",
+                    "payments",
+                ][i % 10];
+                Subscription {
+                    id: format!("00000000-0000-0000-0000-{i:012}"),
+                    name: format!("Contoso-{team}-{env}-{i:04}"),
+                    tenant_id: format!("11111111-2222-3333-4444-{:012}", i % 25),
+                    is_default: i == 42,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let cases = [
+            ("empty", ""),
+            ("prefix_pay", "pay"),
+            ("uuid_substring", "00000000-0000-0000-0000-0000000009"),
+            ("fragments_payments_prod", "payments prod"),
+        ];
+
+        let warmup_iters = 200usize;
+        let bench_runs = 21usize;
+        let ops_per_run = 200usize;
+
+        let baseline_ranked = |query: &str, subscriptions: &[Subscription]| -> Vec<usize> {
+            let query = query.trim().to_lowercase();
+            let fragments = super::name_fragments(&query);
+            let mut matches = subscriptions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    let name_lower = item.name.to_lowercase();
+                    let score = if query.is_empty() {
+                        u8::from(!item.is_default)
+                    } else if name_lower == query {
+                        0
+                    } else {
+                        let id = item.id.to_lowercase();
+                        if id == query {
+                            0
+                        } else if name_lower.starts_with(&query) {
+                            1
+                        } else if name_lower
+                            .split(|c: char| !c.is_alphanumeric())
+                            .any(|w| w.starts_with(&query))
+                        {
+                            2
+                        } else if name_lower.contains(&query) {
+                            3
+                        } else if id.contains(&query)
+                            || item.tenant_id.to_lowercase().contains(&query)
+                        {
+                            4
+                        } else if !fragments.is_empty()
+                            && fragments.iter().all(|f| name_lower.contains(*f))
+                        {
+                            5
+                        } else {
+                            return None;
+                        }
+                    };
+                    Some((score, !item.is_default, name_lower, index))
+                })
+                .collect::<Vec<_>>();
+            matches.sort_unstable();
+            matches.into_iter().map(|(_, _, _, index)| index).collect()
+        };
+
+        let measure = |f: &dyn Fn(&str, &[Subscription]) -> Vec<usize>,
+                       query: &str|
+         -> (f64, f64) {
+            for _ in 0..warmup_iters {
+                black_box(f(black_box(query), black_box(&subscriptions)));
+            }
+            let mut samples_us = Vec::with_capacity(bench_runs);
+            for _ in 0..bench_runs {
+                let start = Instant::now();
+                for _ in 0..ops_per_run {
+                    black_box(f(black_box(query), black_box(&subscriptions)));
+                }
+                samples_us.push(start.elapsed().as_secs_f64() * 1_000_000.0 / ops_per_run as f64);
+            }
+            samples_us.sort_by(f64::total_cmp);
+            let median_us = samples_us[bench_runs / 2];
+            let mean_us = samples_us.iter().sum::<f64>() / bench_runs as f64;
+            (median_us, mean_us)
+        };
+
+        for (label, query) in cases {
+            assert_eq!(
+                ranked_indices(query, &subscriptions),
+                baseline_ranked(query, &subscriptions),
+                "benchmark equivalence failed for {label}"
+            );
+            let (before_med, before_mean) = measure(&baseline_ranked, query);
+            let (after_med, after_mean) = measure(&ranked_indices, query);
+            let speedup = before_med / after_med;
+            println!(
+                "bench {label:<24}: before = {before_med:>7.2} us (mean {before_mean:>7.2} us) | \
+                 after = {after_med:>7.2} us (mean {after_mean:>7.2} us) | speedup = {speedup:>5.2}x"
+            );
+        }
     }
 }
