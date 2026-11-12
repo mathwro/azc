@@ -52,6 +52,11 @@ fn git_watch_paths(manifest_dir: &Path) -> Vec<PathBuf> {
         let ref_path = common_dir.join(reference.trim());
         if ref_path.is_file() {
             paths.push(ref_path);
+        } else if let Some(parent) = ref_path
+            .parent()
+            .and_then(|dir| dir.ancestors().find(|d| d.is_dir()))
+        {
+            paths.push(parent.to_path_buf());
         }
         let packed_refs = common_dir.join("packed-refs");
         if packed_refs.is_file() {
@@ -190,6 +195,22 @@ mod tests {
         fs::write(git_dir.join("HEAD"), "0123456789abcdef\n").unwrap();
 
         assert_eq!(git_watch_paths(temp.path()), vec![git_dir.join("HEAD")]);
+    }
+
+    #[test]
+    fn watches_existing_parent_dir_when_branch_ref_is_packed_only() {
+        let temp = TempDir::new("packed");
+        let git_dir = temp.path().join(".git");
+        let heads_dir = git_dir.join("refs/heads");
+        fs::create_dir_all(&heads_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature/nested\n").unwrap();
+        let packed_refs = git_dir.join("packed-refs");
+        fs::write(&packed_refs, "# pack-refs\n").unwrap();
+
+        assert_eq!(
+            git_watch_paths(temp.path()),
+            vec![git_dir.join("HEAD"), heads_dir, packed_refs]
+        );
     }
 
     #[test]
