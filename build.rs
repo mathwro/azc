@@ -13,9 +13,10 @@ fn main() {
             println!("cargo::rerun-if-changed={}", path.display());
         }
     }
-    let commit = env::var("RELEASE_COMMIT")
-        .ok()
-        .filter(|value| !value.is_empty())
+    let release_commit = env::var("RELEASE_COMMIT").ok();
+    let prebuilt_release = is_prebuilt_release(release_commit.as_deref());
+    let commit = release_commit
+        .filter(|value| !value.trim().is_empty())
         .or_else(|| git_output(&["rev-parse", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_owned());
     let source_date_epoch = env::var("SOURCE_DATE_EPOCH")
@@ -33,6 +34,14 @@ fn main() {
         "cargo::rustc-env=AZC_BUILD_DATE={}",
         unix_epoch_date(source_date_epoch)
     );
+    println!(
+        "cargo::rustc-env=AZC_PREBUILT_RELEASE={}",
+        if prebuilt_release { "1" } else { "0" }
+    );
+}
+
+fn is_prebuilt_release(release_commit: Option<&str>) -> bool {
+    release_commit.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn git_watch_paths(manifest_dir: &Path) -> Vec<PathBuf> {
@@ -129,7 +138,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{git_watch_paths, unix_epoch_date};
+    use super::{git_watch_paths, is_prebuilt_release, unix_epoch_date};
 
     struct TempDir(PathBuf);
 
@@ -247,5 +256,12 @@ mod tests {
                 fs::canonicalize(packed_refs).unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn detects_prebuilt_release_from_release_commit_env() {
+        assert!(!is_prebuilt_release(None));
+        assert!(!is_prebuilt_release(Some("")));
+        assert!(is_prebuilt_release(Some("0123456789abcdef")));
     }
 }

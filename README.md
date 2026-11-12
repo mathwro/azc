@@ -32,23 +32,37 @@ azc --version        # print version and reproducible build metadata
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) installed and available on `PATH`
 - An authenticated Azure CLI session created with `az login`
 - Windows PowerShell/Windows Terminal, a Linux terminal, or a macOS terminal
-- Rust 1.88 or newer, including Cargo, when installing or using `azc update`
+- Rust 1.88 or newer, including Cargo, only when building from source or using `azc update` (not needed for Scoop or Homebrew installs)
 
 ## Install
 
-### Directly from GitHub
+### Scoop and Homebrew
 
-Cargo can build and install a binary directly from a Git repository:
+Stable `vX.Y.Z` releases provide native Windows, macOS, and Linux archives for x86-64 and ARM64. Install the prebuilt executable from the shared Scoop bucket on Windows:
+
+```powershell
+scoop bucket add mathwro https://github.com/mathwro/homebrew-tools
+scoop install mathwro/azc
+scoop update azc
+```
+
+Or from the Homebrew tap on macOS and Linux:
+
+```sh
+brew tap mathwro/tools
+brew install mathwro/tools/azc
+brew upgrade mathwro/tools/azc
+```
+
+### Directly from GitHub (Cargo)
+
+Cargo can also build and install a binary directly from the Git repository:
 
 ```sh
 cargo install --git https://github.com/mathwro/azc.git
 ```
 
 This is the Rust equivalent of installing a Go command from its repository. It checks out the repository, builds the release binary, and places `azc` in Cargo's binary directory.
-
-### Scoop and Homebrew
-
-Stable `vX.Y.Z` releases provide native Windows, macOS, and Linux archives for x86-64 and ARM64. The shared Scoop bucket and Homebrew tap install those immutable GitHub Release assets without building Rust source.
 
 ### From a local checkout
 
@@ -93,7 +107,7 @@ The update command runs:
 cargo install --git https://github.com/mathwro/azc --locked --force
 ```
 
-It therefore requires Cargo, network access to GitHub, and permission to write to Cargo's binary directory. On Windows, `azc` starts Cargo and exits so that Cargo can replace the running executable; keep the terminal open until Cargo finishes.
+It therefore requires Cargo, network access to GitHub, and permission to write to Cargo's binary directory. On Windows, `azc` starts Cargo and exits so that Cargo can replace the running executable; keep the terminal open until Cargo finishes. If `azc` was installed via Homebrew, Scoop, or a prebuilt release archive, `azc update` refuses to run Cargo and prints the matching `brew upgrade mathwro/tools/azc`, `scoop update azc`, or GitHub Releases instruction instead of creating a duplicate binary in `~/.cargo/bin`.
 
 ## Interactive picker
 
@@ -290,7 +304,7 @@ The project-specific contribution and verification contracts are in [`AGENTS.md`
 
 `release.json` selects the typed Rust adapter and stable package/binary identity. The shared `mathwro/homebrew-tools/.github/workflows/release-tool.yml@main` workflow owns Rust testing, target setup, native builds, packaging, checksums, publication, and distribution notification. The release tag version must equal the version in `Cargo.toml`.
 
-Before the first release, merge the shared workflow into `mathwro/homebrew-tools`, require the `CI` and `Workflow Lint` checks in `main` branch protection, create the protected `release` environment with required reviewers, and configure the `DISTRIBUTION_DISPATCH_TOKEN` repository secret. The token must be limited to sending repository dispatches to `mathwro/homebrew-tools`.
+Repository setup requires the shared workflow on `mathwro/homebrew-tools`, `CI` and `Workflow Lint` checks required in `main` branch protection, the protected `release` environment with required reviewers, and the `DISTRIBUTION_DISPATCH_TOKEN` repository secret limited to sending repository dispatches to `mathwro/homebrew-tools`.
 
 Workflow lint runs on every pull request and push to `main`, without path filters, so its required branch-protection check is never skipped for source-only changes.
 
@@ -312,6 +326,6 @@ Release assets are immutable. Never move or recreate a consumed tag, and never r
 Release binaries have these platform properties:
 
 - Linux archives use static musl binaries, avoiding a host libc dependency.
-- macOS archives are currently unsigned. Homebrew's GitHub download path must verify Gatekeeper behavior before the first stable package update; add repository-approved signing later without changing archive names.
+- macOS archives are currently unsigned (not Developer ID signed or notarized); repository-approved signing can be added centrally without changing archive names.
 - Windows archives are native `.exe` files and require no installer, registry writes, administrator access, or profile changes.
 
