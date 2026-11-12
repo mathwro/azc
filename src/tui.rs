@@ -79,11 +79,9 @@ fn choose(
     refresh: bool,
     tenant_mode: bool,
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
-    let mut app = App::new(tenant_mode);
-    app.refreshing = refresh;
     choose_with_app(
         load_in_background(azure, InitialLoad::Accounts { refresh }),
-        app,
+        App::for_accounts(tenant_mode, refresh),
     )
 }
 
@@ -183,7 +181,7 @@ fn run(
     loop {
         // Loader messages only arrive while loading, so redraw on every poll
         // then; once idle, redraw only after terminal events.
-        dirty |= app.loading;
+        dirty |= app.is_loading();
         if app.receive_accounts(&loader.accounts) == Some(Action::Select) {
             return Ok(app.selected().cloned());
         }
@@ -202,10 +200,7 @@ fn run(
                             Action::Select => return Ok(app.selected().cloned()),
                             Action::Refresh => {
                                 if loader.refresh.try_send(()).is_err() {
-                                    app.loading = false;
-                                    app.refreshing = false;
-                                    app.awaiting_refresh = false;
-                                    app.refresh_listing = false;
+                                    app.load_state = LoadState::Idle;
                                     app.load_error =
                                         Some("subscription loader stopped unexpectedly".to_owned());
                                 }
@@ -224,6 +219,22 @@ fn run(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadState {
+    Idle,
+    LoadingSubscriptions,
+    /// `Ctrl+R` queued a server refresh behind an in-flight load; superseded
+    /// messages are ignored until `RefreshStarted` arrives.
+    QueuedRefresh,
+    /// A server refresh's `az account list --refresh` has not returned yet.
+    /// Azure CLI writes its stale active subscription back when it finishes,
+    /// so switching must wait for it.
+    RefreshingSubscriptions,
+    LoadingTenants {
+        refreshing: bool,
+    },
+}
+
 #[derive(Debug)]
 struct App {
     subscriptions: Arc<Vec<Subscription>>,
@@ -234,14 +245,8 @@ struct App {
     filtered: Vec<usize>,
     query: String,
     list_state: ListState,
-    loading: bool,
-    refreshing: bool,
-    awaiting_refresh: bool,
-    /// A server refresh's `az account list --refresh` has not returned yet.
-    /// Azure CLI writes its stale active subscription back when it finishes,
-    /// so switching must wait for it.
-    refresh_listing: bool,
-    /// Subscription ID chosen with Enter while `refresh_listing` was set.
+    load_state: LoadState,
+    /// Subscription ID chosen with Enter while a refresh listing is in flight.
     pending_switch: Option<String>,
     load_error: Option<String>,
     tenant_mode: bool,
@@ -252,6 +257,10 @@ struct App {
 
 impl App {
     fn new(tenant_mode: bool) -> Self {
+        Self::for_accounts(tenant_mode, false)
+    }
+
+    fn for_accounts(tenant_mode: bool, refresh: bool) -> Self {
         Self {
             subscriptions: Arc::new(Vec::new()),
             descriptions: Vec::new(),
@@ -261,10 +270,11 @@ impl App {
             filtered: Vec::new(),
             query: String::new(),
             list_state: ListState::default(),
-            loading: true,
-            refreshing: false,
-            awaiting_refresh: false,
-            refresh_listing: false,
+            load_state: if refresh {
+                LoadState::RefreshingSubscriptions
+            } else {
+                LoadState::LoadingSubscriptions
+            },
             pending_switch: None,
             load_error: None,
             tenant_mode,
@@ -283,7 +293,11 @@ impl App {
     ) -> Self {
         let mut app = Self::new(tenant_mode);
         app.scope_to_current_tenant = false;
-        app.loading = descriptions.is_none();
+        app.load_state = if descriptions.is_none() {
+            LoadState::LoadingTenants { refreshing: false }
+        } else {
+            LoadState::Idle
+        };
         app.descriptions = descriptions.unwrap_or_default();
         app.query = query;
         app.shortlist = shortlist.map(|mut indices| {
@@ -294,29 +308,48 @@ impl App {
         app
     }
 
+    fn is_loading(&self) -> bool {
+        self.load_state != LoadState::Idle
+    }
+
+    fn is_refreshing(&self) -> bool {
+        matches!(
+            self.load_state,
+            LoadState::QueuedRefresh
+                | LoadState::RefreshingSubscriptions
+                | LoadState::LoadingTenants { refreshing: true }
+        )
+    }
+
+    fn is_refresh_listing(&self) -> bool {
+        matches!(
+            self.load_state,
+            LoadState::QueuedRefresh | LoadState::RefreshingSubscriptions
+        )
+    }
+
     fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) -> Option<Action> {
-        if !self.loading {
+        if !self.is_loading() {
             return None;
         }
 
         loop {
             match receiver.try_recv() {
                 Ok(LoadedAccounts::RefreshStarted) => {
-                    self.awaiting_refresh = false;
-                    self.refreshing = true;
-                    self.refresh_listing = true;
+                    self.load_state = LoadState::RefreshingSubscriptions;
                 }
                 // The initial load may finish after Ctrl+R queues a server refresh.
-                Ok(_) if self.awaiting_refresh => {}
+                Ok(_) if self.load_state == LoadState::QueuedRefresh => {}
                 Ok(LoadedAccounts::Cached(subscriptions, descriptions)) => {
                     self.descriptions = descriptions;
                     self.replace_subscriptions(subscriptions.into());
                     self.cached = true;
                 }
                 Ok(LoadedAccounts::Subscriptions(subscriptions)) => {
+                    let refreshing = self.is_refreshing();
                     self.replace_subscriptions(subscriptions);
                     self.cached = false;
-                    self.refresh_listing = false;
+                    self.load_state = LoadState::LoadingTenants { refreshing };
                     let switch = self.take_pending_switch();
                     if switch.is_some() {
                         return switch;
@@ -325,24 +358,18 @@ impl App {
                 Ok(LoadedAccounts::Tenants(descriptions)) => {
                     self.descriptions = descriptions;
                     self.replace_subscriptions(Arc::clone(&self.subscriptions));
-                    self.loading = false;
-                    self.refreshing = false;
+                    self.load_state = LoadState::Idle;
                     break;
                 }
                 // The refreshing Azure CLI process has exited, so it can no longer
                 // overwrite the context; Azure CLI validates the ID when switching.
                 Ok(LoadedAccounts::Failed(error)) => {
-                    self.loading = false;
-                    self.refreshing = false;
-                    self.refresh_listing = false;
+                    self.load_state = LoadState::Idle;
                     self.load_error = Some(error);
                     return self.take_pending_switch();
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.loading = false;
-                    self.refreshing = false;
-                    self.awaiting_refresh = false;
-                    self.refresh_listing = false;
+                    self.load_state = LoadState::Idle;
                     self.pending_switch = None;
                     self.load_error = Some("subscription loader stopped unexpectedly".to_owned());
                     break;
@@ -433,11 +460,8 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Some(Action::Cancel),
-                KeyCode::Char('r') if self.shortlist.is_none() && !self.refreshing => {
-                    self.loading = true;
-                    self.refreshing = true;
-                    self.awaiting_refresh = true;
-                    self.refresh_listing = true;
+                KeyCode::Char('r') if self.shortlist.is_none() && !self.is_refreshing() => {
+                    self.load_state = LoadState::QueuedRefresh;
                     self.load_error = None;
                     Some(Action::Refresh)
                 }
@@ -491,7 +515,7 @@ impl App {
                     self.query.clear();
                     self.refresh_filter();
                     None
-                } else if self.refresh_listing {
+                } else if self.is_refresh_listing() {
                     self.pending_switch =
                         self.selected().map(|subscription| subscription.id.clone());
                     None
@@ -767,13 +791,13 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         "Subscriptions".to_owned()
     };
-    let title = if app.loading {
+    let title = if app.is_loading() {
         format!(
             " {} · {} ",
             list_name,
-            if app.refreshing && app.cached {
+            if app.is_refreshing() && app.cached {
                 "cached · refreshing Azure…"
-            } else if app.refreshing {
+            } else if app.is_refreshing() {
                 "refreshing Azure…"
             } else if app.cached {
                 "cached · updating…"
@@ -784,30 +808,27 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         )
     } else if let Some(error) = &app.load_error {
+        let error = format_single_line(error);
         format!(
             " {}Azure CLI error · {error} ",
             if app.cached { "cached · " } else { "" }
         )
     } else {
+        let total = if app.tenant_mode {
+            app.tenants.len()
+        } else if let Some(id) = tenant_scope {
+            app.tenants
+                .iter()
+                .find(|tenant| tenant.id.trim().eq_ignore_ascii_case(id.trim()))
+                .map_or(0, |tenant| tenant.subscription_count)
+        } else {
+            app.subscriptions.len()
+        };
         format!(
             " {} · {} of {} · current tenant {} ",
             list_name,
             app.filtered.len(),
-            if app.tenant_mode {
-                app.tenants.len()
-            } else {
-                app.subscriptions
-                    .iter()
-                    .filter(|subscription| {
-                        tenant_scope.is_none_or(|id| {
-                            subscription
-                                .tenant_id
-                                .trim()
-                                .eq_ignore_ascii_case(id.trim())
-                        })
-                    })
-                    .count()
-            },
+            total,
             current_tenant
         )
     };
@@ -828,7 +849,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     frame.render_stateful_widget(list, area, &mut app.list_state);
 
-    if !app.loading && app.load_error.is_none() && app.filtered.is_empty() {
+    if !app.is_loading() && app.load_error.is_none() && app.filtered.is_empty() {
         let message = if app.tenant_mode {
             if app.tenants.is_empty() {
                 "No tenants with enabled subscriptions found"
@@ -925,9 +946,22 @@ fn trailing_width(text: &str, max_width: usize) -> String {
     reversed.into_iter().rev().collect()
 }
 
+fn format_single_line(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            line.split(|character: char| character.is_whitespace() || character.is_control())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" — ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Action, App, LoadedAccounts, render, trailing_width};
+    use super::{Action, App, LoadState, LoadedAccounts, render, trailing_width};
     use crate::{
         azure::AzureCli,
         model::{Subscription, TenantDescription, tenants_from_subscriptions},
@@ -951,7 +985,7 @@ mod tests {
 
     fn loaded_app() -> App {
         let mut app = App::new(false);
-        app.loading = false;
+        app.load_state = LoadState::Idle;
         app.replace_subscriptions(subscriptions().into());
         app
     }
@@ -1037,7 +1071,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
         app.receive_accounts(&receiver);
-        assert!(!app.loading);
+        assert!(!app.is_loading());
         assert_eq!(app.filtered, vec![2, 1]);
         assert_eq!(app.selected().unwrap().id, "2");
         app.append_query("Finance");
@@ -1074,8 +1108,8 @@ mod tests {
                     None
                 );
             }
-            assert!(!app.loading);
-            assert!(!app.refreshing);
+            assert!(!app.is_loading());
+            assert!(!app.is_refreshing());
             assert_eq!(app.tenant_mode, tenant_mode);
             assert_eq!(app.selected().unwrap().id, "0");
             assert_eq!(
@@ -1173,7 +1207,7 @@ mod tests {
     #[test]
     fn unmatched_subscription_query_can_be_corrected_before_metadata_arrives() {
         let mut app = App::from_query(subscriptions(), None, "financx".to_owned(), false, None);
-        assert!(app.loading);
+        assert!(app.is_loading());
         assert_eq!(app.query, "financx");
         assert!(app.selected().is_none());
         assert_eq!(
@@ -1192,7 +1226,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
         app.receive_accounts(&receiver);
-        assert!(!app.loading);
+        assert!(!app.is_loading());
         assert_eq!(app.selected().unwrap().id, "0");
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(app.filtered.len(), 3);
@@ -1255,7 +1289,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
 
-        assert!(app.loading);
+        assert!(app.is_loading());
         assert!(app.load_error.is_none());
         assert_eq!(app.query, "hr");
         assert_eq!(app.selected().unwrap().id, "1");
@@ -1285,7 +1319,7 @@ mod tests {
 
         app.receive_accounts(&receiver);
 
-        assert!(app.loading);
+        assert!(app.is_loading());
         assert!(app.load_error.is_none());
         assert_eq!(app.query, "hr");
         assert_eq!(app.selected().unwrap().id, "2");
@@ -1296,7 +1330,7 @@ mod tests {
             .unwrap();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
         app.receive_accounts(&receiver);
-        assert!(!app.loading);
+        assert!(!app.is_loading());
         assert!(app.load_error.is_none());
         assert_eq!(app.query, "hr");
         assert_eq!(app.selected().unwrap().id, "2");
@@ -1320,7 +1354,7 @@ mod tests {
 
         app.receive_accounts(&receiver);
 
-        assert!(!app.loading);
+        assert!(!app.is_loading());
         assert!(app.load_error.is_some());
         assert_eq!(app.query, "hr");
         assert_eq!(app.selected().unwrap().id, "1");
@@ -1328,7 +1362,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             Some(Action::Refresh)
         );
-        assert!(app.loading);
+        assert!(app.is_loading());
         assert!(app.load_error.is_none());
     }
 
@@ -1424,7 +1458,7 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
         // Tenant metadata is still loading, but it never delays a switch.
         app.next();
-        assert!(app.loading);
+        assert!(app.is_loading());
         assert_eq!(app.selected().unwrap().id, "2");
         assert_eq!(
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
@@ -1462,7 +1496,7 @@ mod tests {
             .unwrap();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
         assert_eq!(app.receive_accounts(&receiver), None);
-        assert!(!app.loading);
+        assert!(!app.is_loading());
         assert_eq!(app.selected().unwrap().id, "1");
     }
 
@@ -1680,7 +1714,7 @@ mod tests {
         let mut app = App::new(true);
         app.descriptions = descriptions;
         app.replace_subscriptions(subscriptions.into());
-        app.loading = false;
+        app.load_state = LoadState::Idle;
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
         let frame = terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let lines: Vec<String> = frame
@@ -1799,7 +1833,7 @@ mod tests {
     #[test]
     fn removed_selection_requires_explicit_navigation_before_enter() {
         let mut app = loaded_app();
-        app.loading = true;
+        app.load_state = LoadState::LoadingSubscriptions;
         let (sender, receiver) = std::sync::mpsc::channel();
         let updated: Vec<_> = subscriptions().into_iter().skip(1).collect();
         sender
@@ -1829,7 +1863,7 @@ mod tests {
             .unwrap();
         app.receive_accounts(&receiver);
         app.append_query("hr");
-        assert!(app.loading);
+        assert!(app.is_loading());
         assert_eq!(app.selected().unwrap().id, "2");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1851,7 +1885,7 @@ mod tests {
             .send(LoadedAccounts::Failed("sign in required".to_owned()))
             .unwrap();
         app.receive_accounts(&receiver);
-        assert!(!app.loading);
+        assert!(!app.is_loading());
         assert!(app.cached);
         assert!(app.load_error.is_some());
         assert_eq!(app.selected().unwrap().id, "1");
@@ -1873,7 +1907,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
         app.receive_accounts(&receiver);
-        assert!(app.loading);
+        assert!(app.is_loading());
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             None
@@ -1884,7 +1918,7 @@ mod tests {
             .unwrap();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
         app.receive_accounts(&receiver);
-        assert!(!app.loading);
+        assert!(!app.is_loading());
         assert_eq!(app.query, "hr");
         assert_eq!(app.selected().unwrap().id, "1");
         assert_eq!(
@@ -1911,6 +1945,55 @@ mod tests {
         assert!(rendered.contains("tenant-a"));
         assert!(!rendered.contains("Alpha Outside"));
         assert!(!rendered.contains("tenant-other"));
+    }
+
+    #[test]
+    fn refresh_startup_defers_enter_before_refresh_started_arrives() {
+        let mut app = App::for_accounts(false, true);
+        app.replace_subscriptions(subscriptions().into());
+
+        assert!(app.is_loading());
+        assert!(app.is_refreshing());
+        assert!(app.is_refresh_listing());
+        assert_eq!(
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(footer(&mut app).contains("Waiting for Azure refresh to switch to Finance"));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        assert_eq!(app.receive_accounts(&receiver), None);
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert_eq!(app.selected().unwrap().id, "0");
+    }
+
+    #[test]
+    fn multiline_load_error_renders_cleanly_on_single_title_row() {
+        let mut app = loaded_app();
+        app.load_error = Some(
+            "az account list failed with exit code 1: WARNING: preview\n\n  ERROR: Please run\taz login  \r\n"
+                .to_owned(),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 6)).unwrap();
+        let frame = terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let title_row: String = frame.buffer.content()[420..560]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            title_row.contains(
+                "Azure CLI error · az account list failed with exit code 1: WARNING: preview — ERROR: Please run az login"
+            ),
+            "unexpected title row: {title_row:?}"
+        );
+        assert!(!title_row.chars().any(char::is_control));
     }
 
     #[test]
