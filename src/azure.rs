@@ -3,7 +3,8 @@ use std::{
     error::Error,
     ffi::OsString,
     fmt, io,
-    process::{Child, Command, Output, Stdio},
+    process::{Command, Output, Stdio},
+    thread,
 };
 
 use serde::de::DeserializeOwned;
@@ -61,23 +62,26 @@ impl AzureCli {
             "--only-show-errors",
         ]);
 
-        // Start both before collecting either so their Azure CLI startups overlap.
-        // A child that fills its pipe while the other is collected just waits.
-        let rest = self.spawn(command, "az rest tenant list");
-        let metadata = self.spawn(metadata_command, "az account list tenant metadata");
-        let rest = rest
-            .and_then(|child| self.collect(child, "az rest tenant list"))
-            .and_then(|output| {
+        // Run both commands concurrently on scoped threads so their startups
+        // overlap and neither child can block filling its stdout/stderr pipe
+        // while the other is still running.
+        let (rest, metadata) = thread::scope(|scope| {
+            let metadata = scope.spawn(|| {
+                self.run(metadata_command, "az account list tenant metadata")
+                    .and_then(|output| {
+                        parse_json::<Vec<TenantDescription>>(&output.stdout)
+                            .map_err(AzureError::InvalidTenantMetadataJson)
+                    })
+            });
+            let rest = self.run(command, "az rest tenant list").and_then(|output| {
                 parse_json::<Vec<TenantDescription>>(&output.stdout)
                     .map_err(AzureError::InvalidTenantJson)
             });
-        let metadata = metadata
-            .and_then(|child| self.collect(child, "az account list tenant metadata"))
-            .and_then(|output| {
-                parse_json::<Vec<TenantDescription>>(&output.stdout)
-                    .map_err(AzureError::InvalidTenantMetadataJson)
-            });
-
+            let metadata = metadata
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            (rest, metadata)
+        });
         // Either source alone still yields labels: the local metadata covers
         // offline use and tenants whose Resource Manager access needs sign-in.
         match (rest, metadata) {
@@ -174,25 +178,11 @@ impl AzureCli {
         command
     }
 
-    fn run(&self, command: Command, operation: &'static str) -> Result<Output, AzureError> {
-        self.collect(self.spawn(command, operation)?, operation)
-    }
-
-    /// Starts `command` with the same stdio as `Command::output`.
-    fn spawn(&self, mut command: Command, operation: &'static str) -> Result<Child, AzureError> {
-        command
+    fn run(&self, mut command: Command, operation: &'static str) -> Result<Output, AzureError> {
+        let output = command
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| self.start_error(operation, source))
-    }
-
-    fn collect(&self, child: Child, operation: &'static str) -> Result<Output, AzureError> {
-        let output = child
-            .wait_with_output()
+            .output()
             .map_err(|source| self.start_error(operation, source))?;
-
         if output.status.success() {
             return Ok(output);
         }
@@ -269,18 +259,29 @@ fn windows_ansi_code_page() -> Option<u16> {
     })
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn find_windows_executable_in_path(path: &std::ffi::OsStr) -> Option<OsString> {
+    for directory in env::split_paths(path) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        for file_name in ["az.exe", "az.cmd", "az.bat"] {
+            let candidate = directory.join(file_name);
+            if candidate.is_file() {
+                return Some(candidate.into_os_string());
+            }
+        }
+    }
+    None
+}
+
 fn default_executable() -> OsString {
     #[cfg(target_os = "windows")]
     {
-        if let Some(path) = env::var_os("PATH") {
-            for directory in env::split_paths(&path) {
-                for file_name in ["az.exe", "az.cmd", "az.bat"] {
-                    let candidate = directory.join(file_name);
-                    if candidate.is_file() {
-                        return candidate.into_os_string();
-                    }
-                }
-            }
+        if let Some(executable) =
+            env::var_os("PATH").and_then(|path| find_windows_executable_in_path(&path))
+        {
+            return executable;
         }
 
         // The official Windows installer exposes Azure CLI as az.cmd.
@@ -541,6 +542,78 @@ mod tests {
         assert_eq!(descriptions[1], metadata[0]);
     }
 
+    #[test]
+    fn windows_path_discovery_skips_empty_entries_and_preserves_extension_precedence() {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "azc-win-path-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let cwd = root.join("cwd");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        // Untrusted files in cwd that an empty PATH segment would otherwise resolve.
+        std::fs::write(cwd.join("az.exe"), "").unwrap();
+        std::fs::write(cwd.join("az.cmd"), "").unwrap();
+        std::fs::write(cwd.join("az.bat"), "").unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        struct Cleanup {
+            root: std::path::PathBuf,
+            original_cwd: std::path::PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.original_cwd);
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let _cleanup = Cleanup {
+            root: root.clone(),
+            original_cwd,
+        };
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let path_with_empties = std::ffi::OsString::from(format!(
+            "{sep}{}{sep}{sep}{}{sep}",
+            first.display(),
+            second.display()
+        ));
+
+        assert_eq!(
+            super::find_windows_executable_in_path(&path_with_empties),
+            None
+        );
+
+        // Precedence within a directory: az.exe > az.cmd > az.bat, and earlier directory wins.
+        std::fs::write(second.join("az.exe"), "").unwrap();
+        std::fs::write(first.join("az.bat"), "").unwrap();
+        assert_eq!(
+            super::find_windows_executable_in_path(&path_with_empties),
+            Some(first.join("az.bat").into_os_string())
+        );
+
+        std::fs::write(first.join("az.cmd"), "").unwrap();
+        assert_eq!(
+            super::find_windows_executable_in_path(&path_with_empties),
+            Some(first.join("az.cmd").into_os_string())
+        );
+
+        std::fs::write(first.join("az.exe"), "").unwrap();
+        assert_eq!(
+            super::find_windows_executable_in_path(&path_with_empties),
+            Some(first.join("az.exe").into_os_string())
+        );
+    }
+
     // Do not fork another fake while its script is open for writing.
     #[cfg(unix)]
     static SCRIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -747,7 +820,9 @@ esac
 
         impl FakeAzure {
             /// Each source fails unless its JSON is given. The Resource
-            /// Manager call only answers once the local call has started.
+            /// Manager call only answers once the local call has finished
+            /// writing its payload, so sequential starts or sequential pipe
+            /// collection will deadlock/time out.
             fn new(rest: Option<&str>, local: Option<&str>) -> Self {
                 let guard = super::SCRIPT_LOCK
                     .lock()
@@ -769,13 +844,14 @@ esac
                     path.join("az"),
                     r#"#!/bin/sh
 directory=${0%/*}
+[ "$AZURE_CORE_NO_COLOR" = true ] && [ "$PYTHONIOENCODING" = utf-8 ] || exit 4
 case "$*" in
   'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
     attempts=0
-    while [ ! -f "$directory/local-started" ]; do
+    while [ ! -f "$directory/local-finished" ]; do
       attempts=$((attempts + 1))
-      if [ "$attempts" -gt 100 ]; then
-        echo 'ERROR: tenant commands ran sequentially' >&2
+      if [ "$attempts" -gt 40 ]; then
+        echo 'ERROR: tenant commands deadlocked or ran sequentially' >&2
         exit 3
       fi
       sleep 0.05
@@ -783,14 +859,16 @@ case "$*" in
     source=rest
     ;;
   'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
-    touch "$directory/local-started"
     source=local
     ;;
   *) exit 2 ;;
 esac
 if [ -f "$directory/$source.json" ]; then
   cat "$directory/$source.json"
+  [ "$source" = local ] && touch "$directory/local-finished"
+  exit 0
 else
+  [ "$source" = local ] && touch "$directory/local-finished"
   echo "ERROR: $source tenant data unavailable" >&2
   exit 1
 fi
@@ -886,6 +964,32 @@ fi
                 }
             ));
             assert!(error.to_string().contains("rest tenant data unavailable"));
+        }
+
+        #[test]
+        fn drains_large_local_metadata_pipe_concurrently_without_deadlocking() {
+            let mut local_records = Vec::with_capacity(12_000);
+            for i in 0..12_000 {
+                local_records.push(format!(
+                    r#"{{"tenantId":"tenant-b","displayName":"Fabrikam Enterprise Division {i:05}","defaultDomain":"fabrikam.example"}}"#
+                ));
+            }
+            local_records.push(
+                r#"{"tenantId":"tenant-c","displayName":"Northwind","defaultDomain":"northwind.example"}"#
+                    .to_owned(),
+            );
+            let local_json = format!("[\n{}\n]", local_records.join(",\n"));
+            assert!(local_json.len() > 1_200 * 1024);
+            let fake = FakeAzure::new(Some(RESOURCE_MANAGER), Some(&local_json));
+            let descriptions = fake.list_tenants().unwrap();
+            assert_eq!(
+                labels(&descriptions),
+                [
+                    "Contoso (contoso.example)",
+                    "Fabrikam Enterprise Division 00000 (fabrikam.example)",
+                    "Northwind (northwind.example)"
+                ]
+            );
         }
     }
 }
