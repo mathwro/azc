@@ -97,6 +97,12 @@ cargo check --target x86_64-pc-windows-gnu
 cargo check --target x86_64-apple-darwin
 ```
 
+For matching, tenant grouping, metadata merging, background loading, or TUI rendering changes, also run the local release benchmarks:
+
+```sh
+cargo test --release --locked -- --ignored --nocapture --test-threads=1
+```
+
 For switching behavior, smoke-test both `azc <query>` and the interactive picker against a fake Azure executable supplied through `AZC_AZ_BIN`; assert the ID passed to `account set`. Never use a real subscription for automated verification.
 
 On POSIX, retain process/PTY regressions in `scripts/test_context_switching.py`; run `cargo build --locked` then `python3 scripts/test_context_switching.py`. Linux CI runs this suite. Keep fixtures isolated from real Azure configuration and synchronize on observable state rather than fixed startup sleeps.
