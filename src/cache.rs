@@ -1,9 +1,8 @@
 use std::{
-    collections::hash_map::DefaultHasher,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
+    fmt::Write as _,
     fs::{self, OpenOptions},
-    hash::{Hash, Hasher},
     io::{self, BufReader, BufWriter, Write},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -14,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Subscription, TenantDescription};
 
 const MAX_AGE: u64 = 7 * 24 * 60 * 60;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 pub struct Cache {
     directory: PathBuf,
-    source: u64,
+    source: String,
 }
 
 #[derive(Deserialize)]
@@ -26,7 +25,7 @@ pub struct Cache {
 pub struct Snapshot {
     version: u32,
     saved_at: u64,
-    source: u64,
+    source: String,
     pub subscriptions: Vec<Subscription>,
     pub descriptions: Vec<TenantDescription>,
 }
@@ -42,16 +41,14 @@ impl Cache {
             })?;
         Some(Self::new(
             directory,
-            env::var_os("AZC_AZ_BIN").unwrap_or_else(|| OsString::from("az")),
+            env::var_os("AZC_AZ_BIN").unwrap_or_else(default_executable),
         ))
     }
 
     fn new(directory: PathBuf, executable: OsString) -> Self {
-        let mut source = DefaultHasher::new();
-        executable.hash(&mut source);
         Self {
             directory,
-            source: source.finish(),
+            source: encode_source(&executable),
         }
     }
 
@@ -74,7 +71,7 @@ impl Cache {
         struct Record<'a> {
             version: u32,
             saved_at: u64,
-            source: u64,
+            source: &'a str,
             subscriptions: &'a [Subscription],
             descriptions: &'a [TenantDescription],
         }
@@ -85,7 +82,7 @@ impl Cache {
         let record = Record {
             version: VERSION,
             saved_at,
-            source: self.source,
+            source: &self.source,
             subscriptions,
             descriptions,
         };
@@ -116,9 +113,72 @@ impl Cache {
     }
 }
 
+fn encode_source(executable: &OsStr) -> String {
+    if let Some(utf8) = executable.to_str() {
+        return format!("utf8:{utf8}");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = executable.as_bytes();
+        let mut encoded = String::with_capacity(6 + bytes.len() * 2);
+        encoded.push_str("bytes:");
+        for byte in bytes {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        encoded
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut encoded = String::from("wide:");
+        for unit in executable.encode_wide() {
+            let _ = write!(encoded, "{unit:04x}");
+        }
+        encoded
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("lossy:{}", executable.to_string_lossy())
+    }
+}
+
+fn default_executable() -> OsString {
+    #[cfg(target_os = "windows")]
+    {
+        windows_default_executable(env::var_os("PATH").as_deref())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        OsString::from("az")
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_default_executable(path: Option<&OsStr>) -> OsString {
+    if let Some(path) = path {
+        for directory in env::split_paths(path) {
+            if directory.as_os_str().is_empty() {
+                continue;
+            }
+            for file_name in ["az.exe", "az.cmd", "az.bat"] {
+                let candidate = directory.join(file_name);
+                if candidate.is_file() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+    }
+    OsString::from("az.cmd")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Cache;
+    use super::{Cache, windows_default_executable};
     use crate::model::{Subscription, TenantDescription};
     use std::{
         ffi::OsString,
@@ -186,6 +246,11 @@ mod tests {
             fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
             assert!(cache.load().is_none());
         }
+        let mut v1_numeric_source = valid.clone();
+        v1_numeric_source["version"] = 1.into();
+        v1_numeric_source["source"] = 12345.into();
+        fs::write(&path, serde_json::to_vec(&v1_numeric_source).unwrap()).unwrap();
+        assert!(cache.load().is_none());
         let mut incompatible = valid;
         incompatible["version"] = 999.into();
         fs::write(&path, serde_json::to_vec(&incompatible).unwrap()).unwrap();
@@ -226,5 +291,81 @@ mod tests {
         .unwrap();
         assert!(cache.save(&[], &[]).is_err());
         assert_eq!(cache.load().unwrap().subscriptions[1].id, "beta");
+    }
+
+    #[test]
+    fn stores_deterministic_string_source_and_distinguishes_non_utf8_executables() {
+        let directory = Directory::new();
+        let cache = Cache::new(directory.0.clone(), OsString::from("/opt/az/bin/az"));
+        cache.save(&subscriptions(), &descriptions()).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.0.join("azc-picker-cache.json")).unwrap())
+                .unwrap();
+        assert_eq!(raw["version"], 2);
+        assert_eq!(raw["source"], "utf8:/opt/az/bin/az");
+
+        let forged = Cache::new(
+            directory.0.clone(),
+            OsString::from("bytes:2f6f70742f617a2f62696e2f617a"),
+        );
+        assert!(forged.load().is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let first = Cache::new(
+                directory.0.clone(),
+                OsString::from_vec(vec![b'a', b'z', 0xfe]),
+            );
+            first.save(&subscriptions(), &descriptions()).unwrap();
+            let raw_bytes: serde_json::Value = serde_json::from_slice(
+                &fs::read(directory.0.join("azc-picker-cache.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(raw_bytes["source"], "bytes:617afe");
+            assert!(first.load().is_some());
+
+            let second = Cache::new(
+                directory.0.clone(),
+                OsString::from_vec(vec![b'a', b'z', 0xff]),
+            );
+            assert!(second.load().is_none());
+        }
+    }
+
+    #[test]
+    fn resolves_windows_default_executable_from_non_empty_path_entries() {
+        let first = Directory::new();
+        let second = Directory::new();
+        let bat = second.0.join("az.bat");
+        fs::write(&bat, b"@echo off\r\n").unwrap();
+
+        let path =
+            std::env::join_paths([PathBuf::new(), first.0.clone(), second.0.clone()]).unwrap();
+        assert_eq!(
+            windows_default_executable(Some(&path)),
+            bat.into_os_string()
+        );
+
+        let cmd = second.0.join("az.cmd");
+        fs::write(&cmd, b"@echo off\r\n").unwrap();
+        assert_eq!(
+            windows_default_executable(Some(&path)),
+            cmd.into_os_string()
+        );
+
+        let exe = first.0.join("az.exe");
+        fs::write(&exe, b"MZ").unwrap();
+        assert_eq!(
+            windows_default_executable(Some(&path)),
+            exe.into_os_string()
+        );
+
+        let empty_only = std::env::join_paths([PathBuf::new()]).unwrap();
+        assert_eq!(
+            windows_default_executable(Some(&empty_only)),
+            OsString::from("az.cmd")
+        );
+        assert_eq!(windows_default_executable(None), OsString::from("az.cmd"));
     }
 }
