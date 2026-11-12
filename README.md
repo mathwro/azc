@@ -32,19 +32,9 @@ azc --version        # print version and reproducible build metadata
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) installed and available on `PATH`
 - An authenticated Azure CLI session created with `az login`
 - Windows PowerShell/Windows Terminal, a Linux terminal, or a macOS terminal
-- Rust 1.88 or newer, including Cargo, when installing or using `azc update`
+- Rust 1.88 or newer, including Cargo, only when building from source or using `azc update` (not needed for Scoop or Homebrew installs)
 
 ## Install
-
-### Directly from GitHub
-
-Cargo can build and install a binary directly from a Git repository:
-
-```sh
-cargo install --git https://github.com/mathwro/azc.git
-```
-
-This is the Rust equivalent of installing a Go command from its repository. It checks out the repository, builds the release binary, and places `azc` in Cargo's binary directory.
 
 ### Scoop and Homebrew
 
@@ -63,6 +53,16 @@ brew tap mathwro/tools
 brew install mathwro/tools/azc
 brew upgrade mathwro/tools/azc
 ```
+
+### Directly from GitHub (Cargo)
+
+Cargo can also build and install a binary directly from the Git repository:
+
+```sh
+cargo install --git https://github.com/mathwro/azc.git
+```
+
+This is the Rust equivalent of installing a Go command from its repository. It checks out the repository, builds the release binary, and places `azc` in Cargo's binary directory.
 
 ### From a local checkout
 
@@ -107,7 +107,7 @@ The update command runs:
 cargo install --git https://github.com/mathwro/azc --locked --force
 ```
 
-It therefore requires Cargo, network access to GitHub, and permission to write to Cargo's binary directory. On Windows, `azc` starts Cargo and exits so that Cargo can replace the running executable; keep the terminal open until Cargo finishes.
+It therefore requires Cargo, network access to GitHub, and permission to write to Cargo's binary directory. On Windows, `azc` starts Cargo and exits so that Cargo can replace the running executable; keep the terminal open until Cargo finishes. If you installed `azc` through Scoop or Homebrew, update with `scoop update azc` or `brew upgrade mathwro/tools/azc` instead so Cargo does not place a second binary in `~/.cargo/bin`.
 
 ## Interactive picker
 
