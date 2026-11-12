@@ -10,7 +10,7 @@ use std::{
 };
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
-const LATEST_RELEASE_URL: &str = "https://github.com/mathwro/azc/releases/latest";
+const LATEST_RELEASE_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PREBUILT_RELEASE: bool = matches!(env!("AZC_PREBUILT_RELEASE").as_bytes(), b"1");
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpdateOutcome {
@@ -165,9 +165,21 @@ mod tests {
     #[test]
     fn rejects_homebrew_managed_install_paths() {
         for exe in [
-            "/opt/homebrew/Cellar/azc/0.6.0/bin/azc",
-            "/usr/local/Cellar/azc/0.6.0/bin/azc",
-            "/home/linuxbrew/.linuxbrew/Cellar/azc/0.6.0/bin/azc",
+            concat!(
+                "/opt/homebrew/Cellar/azc/",
+                env!("CARGO_PKG_VERSION"),
+                "/bin/azc"
+            ),
+            concat!(
+                "/usr/local/Cellar/azc/",
+                env!("CARGO_PKG_VERSION"),
+                "/bin/azc"
+            ),
+            concat!(
+                "/home/linuxbrew/.linuxbrew/Cellar/azc/",
+                env!("CARGO_PKG_VERSION"),
+                "/bin/azc"
+            ),
         ] {
             let err = check_install_source(Some(Path::new(exe)), false).unwrap_err();
             assert!(matches!(err, UpdateError::ManagedByHomebrew(_)));
@@ -178,7 +190,11 @@ mod tests {
     #[test]
     fn rejects_scoop_managed_install_paths() {
         for exe in [
-            r"C:\Users\alice\scoop\apps\azc\0.6.0\azc.exe",
+            concat!(
+                r"C:\Users\alice\scoop\apps\azc\",
+                env!("CARGO_PKG_VERSION"),
+                r"\azc.exe"
+            ),
             r"C:\ProgramData\scoop\apps\azc\current\azc.exe",
         ] {
             let err = check_install_source(Some(Path::new(exe)), false).unwrap_err();
