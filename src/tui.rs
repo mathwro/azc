@@ -146,30 +146,49 @@ fn load_accounts(azure: &AzureCli, refresh: bool, sender: &Sender<LoadedAccounts
             return false;
         }
     }
-    let subscriptions: Arc<Vec<Subscription>> = match azure.list_subscriptions(refresh) {
-        Ok(subscriptions) => subscriptions.into(),
-        Err(error) => {
-            return sender
-                .send(LoadedAccounts::Failed(error.to_string()))
-                .is_ok();
+    thread::scope(|scope| {
+        // Overlap read-only tenant metadata discovery with `az account list`.
+        // Refresh loads wait for `az account list --refresh` before reading tenants.
+        let tenants = (!refresh).then(|| scope.spawn(|| azure.list_tenants()));
+        let subscriptions: Arc<Vec<Subscription>> = match azure.list_subscriptions(refresh) {
+            Ok(subscriptions) => subscriptions.into(),
+            Err(error) => {
+                return sender
+                    .send(LoadedAccounts::Failed(error.to_string()))
+                    .is_ok();
+            }
+        };
+        // Save and publish subscriptions before waiting for tenant metadata, keeping
+        // previous tenant labels in case the user switches before metadata arrives.
+        if let Some(cache) = &cache {
+            let _ = cache.save(&subscriptions, &previous_descriptions);
         }
-    };
-    // Save and publish subscriptions before waiting for tenant metadata, keeping
-    // previous tenant labels in case the user switches before metadata arrives.
-    if let Some(cache) = &cache {
-        let _ = cache.save(&subscriptions, &previous_descriptions);
+        if sender
+            .send(LoadedAccounts::Subscriptions(Arc::clone(&subscriptions)))
+            .is_err()
+        {
+            return false;
+        }
+        let descriptions = match tenants {
+            Some(handle) => handle
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
+            None => azure.list_tenants(),
+        }
+        .unwrap_or_default();
+        if let Some(cache) = &cache {
+            let _ = cache.save(&subscriptions, &descriptions);
+        }
+        sender.send(LoadedAccounts::Tenants(descriptions)).is_ok()
+    })
+}
+
+fn poll_timeout(app: &App) -> Duration {
+    if app.is_loading() && !app.has_accounts {
+        Duration::from_millis(5)
+    } else {
+        Duration::from_millis(50)
     }
-    if sender
-        .send(LoadedAccounts::Subscriptions(Arc::clone(&subscriptions)))
-        .is_err()
-    {
-        return false;
-    }
-    let descriptions = azure.list_tenants().unwrap_or_default();
-    if let Some(cache) = &cache {
-        let _ = cache.save(&subscriptions, &descriptions);
-    }
-    sender.send(LoadedAccounts::Tenants(descriptions)).is_ok()
 }
 
 fn run(
@@ -179,10 +198,9 @@ fn run(
 ) -> Result<Option<Subscription>, Box<dyn Error>> {
     let mut dirty = true;
     loop {
-        // Loader messages only arrive while loading, so redraw on every poll
-        // then; once idle, redraw only after terminal events.
-        dirty |= app.is_loading();
-        if app.receive_accounts(&loader.accounts) == Some(Action::Select) {
+        let outcome = app.receive_accounts(&loader.accounts);
+        dirty |= outcome.changed;
+        if outcome.action == Some(Action::Select) {
             return Ok(app.selected().cloned());
         }
         if dirty {
@@ -190,7 +208,7 @@ fn run(
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(poll_timeout(&app))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     dirty = true;
@@ -328,15 +346,20 @@ impl App {
         )
     }
 
-    fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) -> Option<Action> {
+    fn receive_accounts(&mut self, receiver: &Receiver<LoadedAccounts>) -> PollOutcome {
         if !self.is_loading() {
-            return None;
+            return PollOutcome {
+                changed: false,
+                action: None,
+            };
         }
 
+        let mut changed = false;
         loop {
             match receiver.try_recv() {
                 Ok(LoadedAccounts::RefreshStarted) => {
                     self.load_state = LoadState::RefreshingSubscriptions;
+                    changed = true;
                 }
                 // The initial load may finish after Ctrl+R queues a server refresh.
                 Ok(_) if self.load_state == LoadState::QueuedRefresh => {}
@@ -344,21 +367,27 @@ impl App {
                     self.descriptions = descriptions;
                     self.replace_subscriptions(subscriptions.into());
                     self.cached = true;
+                    changed = true;
                 }
                 Ok(LoadedAccounts::Subscriptions(subscriptions)) => {
                     let refreshing = self.is_refreshing();
                     self.replace_subscriptions(subscriptions);
                     self.cached = false;
                     self.load_state = LoadState::LoadingTenants { refreshing };
+                    changed = true;
                     let switch = self.take_pending_switch();
                     if switch.is_some() {
-                        return switch;
+                        return PollOutcome {
+                            changed,
+                            action: switch,
+                        };
                     }
                 }
                 Ok(LoadedAccounts::Tenants(descriptions)) => {
                     self.descriptions = descriptions;
                     self.replace_subscriptions(Arc::clone(&self.subscriptions));
                     self.load_state = LoadState::Idle;
+                    changed = true;
                     break;
                 }
                 // The refreshing Azure CLI process has exited, so it can no longer
@@ -366,18 +395,25 @@ impl App {
                 Ok(LoadedAccounts::Failed(error)) => {
                     self.load_state = LoadState::Idle;
                     self.load_error = Some(error);
-                    return self.take_pending_switch();
+                    return PollOutcome {
+                        changed: true,
+                        action: self.take_pending_switch(),
+                    };
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.load_state = LoadState::Idle;
                     self.pending_switch = None;
                     self.load_error = Some("subscription loader stopped unexpectedly".to_owned());
+                    changed = true;
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
             }
         }
-        None
+        PollOutcome {
+            changed,
+            action: None,
+        }
     }
 
     /// Completes a deferred Enter if its subscription is still highlighted.
@@ -651,6 +687,12 @@ enum Action {
     Refresh,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PollOutcome {
+    changed: bool,
+    action: Option<Action>,
+}
+
 fn render(frame: &mut Frame, app: &mut App) {
     let [search_area, list_area, footer_area] = Layout::vertical([
         Constraint::Length(3),
@@ -764,7 +806,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 ListItem::new(Line::from(vec![
                     Span::styled(marker, marker_style),
-                    Span::styled(subscription.name.clone(), name_style),
+                    Span::styled(subscription.name.as_str(), name_style),
                     Span::styled(
                         format!("  {}", subscription.id),
                         Style::new().fg(Color::DarkGray),
@@ -774,7 +816,6 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect::<Vec<_>>()
     };
 
-    let current_tenant = current_tenant_label(app);
     let tenant_scope = app.scoped_tenant_id();
     let list_name = if app.tenant_mode {
         "Tenants".to_owned()
@@ -811,6 +852,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             if app.cached { "cached · " } else { "" }
         )
     } else {
+        let current_tenant = current_tenant_label(app);
         let total = if app.tenant_mode {
             app.tenants.len()
         } else if let Some(id) = tenant_scope {
@@ -966,7 +1008,9 @@ fn format_single_line(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, App, LoadState, LoadedAccounts, render, trailing_width};
+    use super::{
+        Action, App, LoadState, LoadedAccounts, PollOutcome, poll_timeout, render, trailing_width,
+    };
     use crate::{
         azure::AzureCli,
         model::{Subscription, TenantDescription, tenants_from_subscriptions},
@@ -1395,11 +1439,11 @@ mod tests {
         );
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(LoadedAccounts::RefreshStarted).unwrap();
-        assert_eq!(app.receive_accounts(&receiver), None);
+        assert_eq!(app.receive_accounts(&receiver).action, None);
 
         assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
         assert!(footer(&mut app).contains("Waiting for Azure refresh to switch to HR Production"));
-        assert_eq!(app.receive_accounts(&receiver), None);
+        assert_eq!(app.receive_accounts(&receiver).action, None);
 
         let mut refreshed = subscriptions();
         refreshed.reverse();
@@ -1407,7 +1451,7 @@ mod tests {
             .send(LoadedAccounts::Subscriptions(refreshed.into()))
             .unwrap();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
-        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert_eq!(app.receive_accounts(&receiver).action, Some(Action::Select));
         assert_eq!(app.selected().unwrap().id, "1");
     }
 
@@ -1430,13 +1474,13 @@ mod tests {
             .send(LoadedAccounts::Subscriptions(subscriptions().into()))
             .unwrap();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
-        assert_eq!(app.receive_accounts(&receiver), None);
+        assert_eq!(app.receive_accounts(&receiver).action, None);
         sender.send(LoadedAccounts::RefreshStarted).unwrap();
-        assert_eq!(app.receive_accounts(&receiver), None);
+        assert_eq!(app.receive_accounts(&receiver).action, None);
         sender
             .send(LoadedAccounts::Subscriptions(subscriptions().into()))
             .unwrap();
-        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert_eq!(app.receive_accounts(&receiver).action, Some(Action::Select));
         assert_eq!(app.selected().unwrap().id, "0");
     }
 
@@ -1457,7 +1501,7 @@ mod tests {
             .send(LoadedAccounts::Subscriptions(refreshed.into()))
             .unwrap();
 
-        assert_eq!(app.receive_accounts(&receiver), None);
+        assert_eq!(app.receive_accounts(&receiver).action, None);
         assert!(app.selected().is_none());
         assert!(!footer(&mut app).contains("Waiting for Azure refresh"));
         assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
@@ -1500,7 +1544,7 @@ mod tests {
             .send(LoadedAccounts::Subscriptions(subscriptions().into()))
             .unwrap();
         sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
-        assert_eq!(app.receive_accounts(&receiver), None);
+        assert_eq!(app.receive_accounts(&receiver).action, None);
         assert!(!app.is_loading());
         assert_eq!(app.selected().unwrap().id, "1");
     }
@@ -1519,7 +1563,7 @@ mod tests {
             .send(LoadedAccounts::Failed("refresh failed".to_owned()))
             .unwrap();
 
-        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert_eq!(app.receive_accounts(&receiver).action, Some(Action::Select));
         assert!(app.load_error.is_some());
         assert_eq!(app.selected().unwrap().id, "1");
     }
@@ -1969,11 +2013,11 @@ mod tests {
 
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(LoadedAccounts::RefreshStarted).unwrap();
-        assert_eq!(app.receive_accounts(&receiver), None);
+        assert_eq!(app.receive_accounts(&receiver).action, None);
         sender
             .send(LoadedAccounts::Subscriptions(subscriptions().into()))
             .unwrap();
-        assert_eq!(app.receive_accounts(&receiver), Some(Action::Select));
+        assert_eq!(app.receive_accounts(&receiver).action, Some(Action::Select));
         assert_eq!(app.selected().unwrap().id, "0");
     }
 
@@ -2005,5 +2049,502 @@ mod tests {
     fn keeps_the_visible_end_of_a_long_query() {
         assert_eq!(trailing_width("123456", 4), "3456");
         assert_eq!(trailing_width("a界b", 3), "界b");
+    }
+    #[test]
+    fn receive_accounts_reports_change_only_when_loader_updates_state() {
+        let mut app = App::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        // Empty channel while loading must NOT report `changed` (prevents 20 Hz full redraws).
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: false,
+                action: None,
+            }
+        );
+        assert_eq!(poll_timeout(&app), std::time::Duration::from_millis(5));
+
+        // Cached snapshot arrives -> changed: true, and poll_timeout relaxes to 50 ms.
+        sender
+            .send(LoadedAccounts::Cached(subscriptions(), vec![]))
+            .unwrap();
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: true,
+                action: None,
+            }
+        );
+        assert_eq!(poll_timeout(&app), std::time::Duration::from_millis(50));
+
+        // Subsequent empty poll while still loading -> changed: false.
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: false,
+                action: None,
+            }
+        );
+
+        // Live subscriptions arrive -> changed: true.
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: true,
+                action: None,
+            }
+        );
+
+        // Superseded messages during QueuedRefresh -> changed: false.
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: false,
+                action: None,
+            }
+        );
+
+        // RefreshStarted -> changed: true.
+        sender.send(LoadedAccounts::RefreshStarted).unwrap();
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: true,
+                action: None,
+            }
+        );
+
+        // Deferred switch completed by Subscriptions -> changed: true, action: Some(Action::Select).
+        assert_eq!(press(&mut app, KeyCode::Enter, KeyModifiers::NONE), None);
+        sender
+            .send(LoadedAccounts::Subscriptions(subscriptions().into()))
+            .unwrap();
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: true,
+                action: Some(Action::Select),
+            }
+        );
+
+        // Tenants arrive -> changed: true, transitions to Idle.
+        sender.send(LoadedAccounts::Tenants(vec![])).unwrap();
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: true,
+                action: None,
+            }
+        );
+        assert!(!app.is_loading());
+
+        // Once Idle, receive_accounts returns changed: false even if messages are queued.
+        sender
+            .send(LoadedAccounts::Failed("ignored".to_owned()))
+            .unwrap();
+        assert_eq!(
+            app.receive_accounts(&receiver),
+            PollOutcome {
+                changed: false,
+                action: None,
+            }
+        );
+
+        // Failed while loading -> changed: true.
+        let mut failed_app = App::new(false);
+        let (fail_tx, fail_rx) = std::sync::mpsc::channel();
+        fail_tx
+            .send(LoadedAccounts::Failed("boom".to_owned()))
+            .unwrap();
+        assert_eq!(
+            failed_app.receive_accounts(&fail_rx),
+            PollOutcome {
+                changed: true,
+                action: None,
+            }
+        );
+
+        // Disconnected while loading -> changed: true.
+        let mut disc_app = App::new(false);
+        let (disc_tx, disc_rx) = std::sync::mpsc::channel();
+        drop(disc_tx);
+        assert_eq!(
+            disc_app.receive_accounts(&disc_rx),
+            PollOutcome {
+                changed: true,
+                action: None,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    mod loader_concurrency {
+        use super::super::{LoadedAccounts, load_accounts};
+        use crate::azure::AzureCli;
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            path::PathBuf,
+            sync::{
+                Mutex, MutexGuard,
+                atomic::{AtomicU64, Ordering},
+                mpsc,
+            },
+            thread,
+            time::Duration,
+        };
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        pub(super) struct FakeLoaderEnv {
+            pub(super) dir: PathBuf,
+            prev_az: Option<std::ffi::OsString>,
+            prev_cfg: Option<std::ffi::OsString>,
+            _guard: MutexGuard<'static, ()>,
+        }
+
+        impl FakeLoaderEnv {
+            pub(super) fn new(script: &str) -> Self {
+                let guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "azc-tui-loader-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir_all(&dir).unwrap();
+                let script_path = dir.join("az");
+                fs::write(&script_path, script).unwrap();
+                fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+                let prev_az = std::env::var_os("AZC_AZ_BIN");
+                let prev_cfg = std::env::var_os("AZURE_CONFIG_DIR");
+                // SAFETY: Protected by `ENV_LOCK` across tests in this module.
+                unsafe {
+                    std::env::set_var("AZC_AZ_BIN", &script_path);
+                    std::env::set_var("AZURE_CONFIG_DIR", dir.join("azure"));
+                }
+                Self {
+                    dir,
+                    prev_az,
+                    prev_cfg,
+                    _guard: guard,
+                }
+            }
+        }
+
+        impl Drop for FakeLoaderEnv {
+            fn drop(&mut self) {
+                // SAFETY: Protected by `ENV_LOCK`.
+                unsafe {
+                    match &self.prev_az {
+                        Some(val) => std::env::set_var("AZC_AZ_BIN", val),
+                        None => std::env::remove_var("AZC_AZ_BIN"),
+                    }
+                    match &self.prev_cfg {
+                        Some(val) => std::env::set_var("AZURE_CONFIG_DIR", val),
+                        None => std::env::remove_var("AZURE_CONFIG_DIR"),
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        #[test]
+        fn non_refresh_load_overlaps_subscriptions_and_tenants_and_delivers_subscriptions_first() {
+            // `account list` waits until `rest` has started (proving `list_tenants()` was
+            // spawned concurrently before `list_subscriptions(false)` finished!).
+            // Meanwhile `rest` waits until `release-tenants` is touched by the test thread
+            // AFTER receiving `LoadedAccounts::Subscriptions` (proving `Subscriptions` is
+            // published without waiting for `list_tenants()` to finish!).
+            let env = FakeLoaderEnv::new(
+                r#"#!/bin/sh
+directory=${0%/*}
+case "$*" in
+  'account list --output json --only-show-errors')
+    attempts=0
+    while [ ! -f "$directory/tenants-started" ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 150 ]; then
+        echo "list_tenants did not overlap with list_subscriptions" >&2
+        exit 1
+      fi
+      sleep 0.01
+    done
+    printf '[{"id":"sub-1","name":"Alpha","tenantId":"tenant-a","isDefault":true}]\n'
+    ;;
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
+    touch "$directory/tenants-started"
+    attempts=0
+    while [ ! -f "$directory/release-tenants" ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 200 ]; then
+        echo "timed out waiting for release-tenants" >&2
+        exit 1
+      fi
+      sleep 0.01
+    done
+    printf '[{"tenantId":"tenant-a","displayName":"Tenant A","defaultDomain":"a.example"}]\n'
+    ;;
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    touch "$directory/tenants-started"
+    printf '[{"tenantId":"tenant-a","displayName":"Tenant A","defaultDomain":"a.example"}]\n'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+            );
+            let azure = AzureCli::from_env();
+            let (sender, receiver) = mpsc::channel();
+            let dir = env.dir.clone();
+            let handle = thread::spawn(move || load_accounts(&azure, false, &sender));
+
+            let first = receiver
+                .recv_timeout(Duration::from_secs(3))
+                .expect("Subscriptions must arrive while tenant metadata is still blocked");
+            match first {
+                LoadedAccounts::Subscriptions(subs) => {
+                    assert_eq!(subs.len(), 1);
+                    assert_eq!(subs[0].id, "sub-1");
+                }
+                _ => panic!("expected LoadedAccounts::Subscriptions first"),
+            }
+
+            fs::write(dir.join("release-tenants"), b"ok").unwrap();
+
+            let second = receiver
+                .recv_timeout(Duration::from_secs(3))
+                .expect("Tenants must arrive once released");
+            match second {
+                LoadedAccounts::Tenants(tenants) => {
+                    assert_eq!(tenants.len(), 1);
+                    assert_eq!(tenants[0].display_name, "Tenant A");
+                }
+                _ => panic!("expected LoadedAccounts::Tenants second"),
+            }
+            assert!(handle.join().unwrap());
+        }
+
+        #[test]
+        fn refresh_load_finishes_subscriptions_before_starting_tenants() {
+            // With `refresh = true`, `az account list --refresh` mutates local Azure CLI
+            // profile state, so `list_tenants()` MUST NOT start until `--refresh` completes.
+            let env = FakeLoaderEnv::new(
+                r#"#!/bin/sh
+directory=${0%/*}
+case "$*" in
+  'account list --output json --only-show-errors --refresh')
+    sleep 0.05
+    printf '[{"id":"sub-1","name":"Alpha","tenantId":"tenant-a","isDefault":true}]\n'
+    touch "$directory/refresh-finished"
+    ;;
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json' | \
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    if [ ! -f "$directory/refresh-finished" ]; then
+      touch "$directory/started-before-refresh"
+      echo "tenant query started before refresh finished" >&2
+      exit 1
+    fi
+    printf '[{"tenantId":"tenant-a","displayName":"Tenant A","defaultDomain":"a.example"}]\n'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+            );
+            let azure = AzureCli::from_env();
+            let (sender, receiver) = mpsc::channel();
+            assert!(load_accounts(&azure, true, &sender));
+            assert!(!env.dir.join("started-before-refresh").exists());
+
+            let messages: Vec<_> = receiver.try_iter().collect();
+            assert!(matches!(
+                messages.first(),
+                Some(LoadedAccounts::RefreshStarted)
+            ));
+            assert!(matches!(
+                messages.get(1),
+                Some(LoadedAccounts::Subscriptions(_))
+            ));
+            assert!(matches!(
+                messages.get(2),
+                Some(LoadedAccounts::Tenants(tenants)) if tenants.len() == 1 && tenants[0].display_name == "Tenant A"
+            ));
+        }
+    }
+
+    fn subscriptions_1000() -> Vec<Subscription> {
+        (0..1_000)
+            .map(|index| Subscription {
+                id: format!("{index:08x}-0000-4000-8000-{index:012x}"),
+                name: format!("Enterprise Cloud Subscription Workload {index:04} - Production"),
+                tenant_id: format!("tenant-{:02}", index % 5),
+                is_default: index == 0,
+            })
+            .collect()
+    }
+
+    fn median_nanos(mut samples: Vec<u128>) -> u128 {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_render_list_1000_subscriptions() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let descriptions: Vec<TenantDescription> = (0..5)
+            .map(|index| TenantDescription {
+                tenant_id: format!("tenant-{index:02}"),
+                display_name: format!("Enterprise Tenant {index:02}"),
+                default_domain: format!("tenant{index:02}.example.com"),
+            })
+            .collect();
+
+        // 1. Active render() throughput with 1,000 visible/filtered subscriptions
+        let mut active_app = App::from_query(
+            subscriptions_1000(),
+            Some(descriptions.clone()),
+            String::new(),
+            false,
+            None,
+        );
+        assert_eq!(active_app.filtered.len(), 1_000);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for _ in 0..20 {
+            terminal
+                .draw(|frame| render(frame, black_box(&mut active_app)))
+                .unwrap();
+        }
+        let mut render_samples = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let start = Instant::now();
+            terminal
+                .draw(|frame| render(frame, black_box(&mut active_app)))
+                .unwrap();
+            render_samples.push(start.elapsed().as_nanos());
+        }
+        let render_median_ns = median_nanos(render_samples.clone());
+        let render_mean_ns = render_samples.iter().sum::<u128>() / render_samples.len() as u128;
+
+        // 2. Loading render() throughput (e.g. cached 1,000 subscriptions while refreshing/updating)
+        let mut loading_app = App::from_query(
+            subscriptions_1000(),
+            Some(descriptions),
+            String::new(),
+            false,
+            None,
+        );
+        loading_app.load_state = LoadState::LoadingTenants { refreshing: false };
+        for _ in 0..20 {
+            terminal
+                .draw(|frame| render(frame, black_box(&mut loading_app)))
+                .unwrap();
+        }
+        let mut loading_render_samples = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let start = Instant::now();
+            terminal
+                .draw(|frame| render(frame, black_box(&mut loading_app)))
+                .unwrap();
+            loading_render_samples.push(start.elapsed().as_nanos());
+        }
+        let loading_render_median_ns = median_nanos(loading_render_samples);
+
+        // 3. Simulated 40 empty background-load polls (2 seconds at 50ms poll interval)
+        let (_sender, receiver) = std::sync::mpsc::channel::<LoadedAccounts>();
+        for _ in 0..10 {
+            let outcome = loading_app.receive_accounts(black_box(&receiver));
+            if outcome.changed {
+                terminal
+                    .draw(|frame| render(frame, black_box(&mut loading_app)))
+                    .unwrap();
+            }
+        }
+        let mut idle_poll_samples = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let start = Instant::now();
+            for _ in 0..40 {
+                let outcome = loading_app.receive_accounts(black_box(&receiver));
+                if outcome.changed {
+                    terminal
+                        .draw(|frame| render(frame, black_box(&mut loading_app)))
+                        .unwrap();
+                }
+            }
+            idle_poll_samples.push(start.elapsed().as_nanos());
+        }
+        let idle_poll_median_ns = median_nanos(idle_poll_samples.clone());
+        let idle_poll_mean_ns =
+            idle_poll_samples.iter().sum::<u128>() / idle_poll_samples.len() as u128;
+
+        println!(
+            "BENCH render_1000_idle: median={:.2}us mean={:.2}us | render_1000_loading: median={:.2}us | 40_empty_loading_polls: median={:.2}us mean={:.2}us",
+            render_median_ns as f64 / 1_000.0,
+            render_mean_ns as f64 / 1_000.0,
+            loading_render_median_ns as f64 / 1_000.0,
+            idle_poll_median_ns as f64 / 1_000.0,
+            idle_poll_mean_ns as f64 / 1_000.0,
+        );
+
+        #[cfg(unix)]
+        {
+            use std::fs;
+
+            let env = loader_concurrency::FakeLoaderEnv::new(
+                r#"#!/bin/sh
+sleep 0.15
+case "$*" in
+  'account list --output json --only-show-errors')
+    printf '[{"id":"sub-1","name":"Alpha","tenantId":"tenant-a","isDefault":true}]\n'
+    ;;
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
+    printf '[{"tenantId":"tenant-a","displayName":"Tenant A","defaultDomain":"a.example"}]\n'
+    ;;
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    printf '[{"tenantId":"tenant-a","displayName":"Tenant A","defaultDomain":"a.example"}]\n'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+            );
+            let azure = AzureCli::from_env();
+            // Warmup
+            {
+                let (tx, _rx) = std::sync::mpsc::channel();
+                let _ = fs::remove_dir_all(env.dir.join("azure"));
+                super::load_accounts(&azure, false, &tx);
+            }
+            let mut load_samples = Vec::with_capacity(5);
+            for _ in 0..5 {
+                let _ = fs::remove_dir_all(env.dir.join("azure"));
+                let (tx, rx) = std::sync::mpsc::channel();
+                let start = Instant::now();
+                assert!(super::load_accounts(black_box(&azure), false, &tx));
+                let elapsed = start.elapsed().as_nanos();
+                let msgs: Vec<_> = rx.try_iter().collect();
+                assert_eq!(msgs.len(), 2);
+                load_samples.push(elapsed);
+            }
+            let load_median_ms = median_nanos(load_samples.clone()) as f64 / 1_000_000.0;
+            let load_mean_ms = (load_samples.iter().sum::<u128>() / load_samples.len() as u128)
+                as f64
+                / 1_000_000.0;
+            println!(
+                "BENCH load_accounts_150ms_az: median={load_median_ms:.2}ms mean={load_mean_ms:.2}ms"
+            );
+        }
     }
 }
