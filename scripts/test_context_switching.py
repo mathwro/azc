@@ -16,7 +16,9 @@ import termios
 import time
 import unittest
 
-BINARY = Path(__file__).resolve().parents[1] / "target/debug/azc"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BINARY = REPO_ROOT / "target/debug/azc"
+BINARY = Path(os.environ.get("AZC_BIN") or DEFAULT_BINARY)
 ROWS = [
     {"id": sid, "name": name, "tenantId": tenant, "isDefault": current}
     for sid, name, tenant, current in [
@@ -56,6 +58,36 @@ elif args[:1] == ['rest'] or args[:3] == ['account', 'list', '--all']:
 elif args[:3] != ['account', 'set', '--subscription']:
     sys.exit(91)
 '''
+
+
+def verify_binary(binary, repo_root, check_freshness):
+    if not binary.is_file():
+        label = "target/debug/azc" if binary == repo_root / "target/debug/azc" else str(binary)
+        raise RuntimeError(f"{label} not found; run 'cargo build --locked' first")
+    if not check_freshness:
+        return
+    binary_mtime = binary.stat().st_mtime
+    inputs = [repo_root / name for name in ("Cargo.toml", "Cargo.lock", "build.rs")]
+    inputs.extend(sorted((repo_root / "src").glob("*.rs")))
+    newer = [
+        str(path.relative_to(repo_root))
+        for path in inputs
+        if path.is_file() and path.stat().st_mtime > binary_mtime
+    ]
+    if newer:
+        raise RuntimeError(
+            f"target/debug/azc is stale (older than {', '.join(newer)}); "
+            "run 'cargo build --locked' first"
+        )
+
+
+def setUpModule():
+    verify_binary(
+        BINARY,
+        REPO_ROOT,
+        check_freshness=not os.environ.get("AZC_BIN")
+        and BINARY.resolve() == DEFAULT_BINARY.resolve(),
+    )
 
 
 class ContextSwitching(unittest.TestCase):
@@ -233,6 +265,30 @@ class ContextSwitching(unittest.TestCase):
                     finally:
                         os.close(master)
                         os.close(slave)
+
+    def test_verify_binary_rejects_missing_and_stale_default_binary(self):
+        with tempfile.TemporaryDirectory(prefix="azc-bin-guard-") as temp:
+            repo = Path(temp)
+            (repo / "src").mkdir()
+            for rel in ["Cargo.toml", "Cargo.lock", "build.rs", "src/main.rs"]:
+                (repo / rel).write_text("// stub\n")
+            default_bin = repo / "target/debug/azc"
+
+            with self.assertRaisesRegex(RuntimeError, "cargo build --locked"):
+                verify_binary(default_bin, repo, check_freshness=True)
+
+            default_bin.parent.mkdir(parents=True)
+            default_bin.write_text("binary")
+            now = time.time()
+            os.utime(default_bin, (now - 10, now - 10))
+            os.utime(repo / "src/main.rs", (now, now))
+
+            with self.assertRaisesRegex(RuntimeError, "stale.*cargo build --locked"):
+                verify_binary(default_bin, repo, check_freshness=True)
+
+            verify_binary(default_bin, repo, check_freshness=False)
+            os.utime(default_bin, (now + 10, now + 10))
+            verify_binary(default_bin, repo, check_freshness=True)
 
 
 if __name__ == '__main__':
