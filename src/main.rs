@@ -12,6 +12,7 @@ use std::{
     error::Error,
     io::{self, IsTerminal, Write},
     process::ExitCode,
+    thread,
 };
 
 use azure::{AzureCli, AzureError};
@@ -69,8 +70,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Command::Tenant { query, refresh } => {
             azure = AzureCli::from_env();
             let selected = if let Some(query) = query {
-                let subscriptions = azure.list_subscriptions(refresh)?;
-                let descriptions = azure.list_tenants().unwrap_or_default();
+                let (subscriptions, descriptions) = load_tenant_query_accounts(&azure, refresh)?;
                 let tenants = tenants_from_subscriptions(&subscriptions, &descriptions);
                 match unique_tenant_match(&query, &tenants) {
                     Ok(tenant) => Some(subscriptions[tenant.subscription_index].clone()),
@@ -96,6 +96,27 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("{}", switched_message(&subscription, tenant_mode));
     }
     Ok(())
+}
+
+fn load_tenant_query_accounts(
+    azure: &AzureCli,
+    refresh: bool,
+) -> Result<(Vec<Subscription>, Vec<TenantDescription>), AzureError> {
+    // `--refresh` rewrites local `azureProfile.json`, which `list_tenants` reads via `az account list --all`.
+    if refresh {
+        let subscriptions = azure.list_subscriptions(true)?;
+        let descriptions = azure.list_tenants().unwrap_or_default();
+        return Ok((subscriptions, descriptions));
+    }
+
+    thread::scope(|scope| {
+        let descriptions = scope.spawn(|| azure.list_tenants());
+        let subscriptions = azure.list_subscriptions(false);
+        let descriptions = descriptions
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        subscriptions.map(|subscriptions| (subscriptions, descriptions.unwrap_or_default()))
+    })
 }
 
 fn switched_message(subscription: &Subscription, tenant_mode: bool) -> String {
@@ -220,5 +241,260 @@ mod tests {
             switched_message(&subscription, true),
             "Switched to tenant tenant-a via Payments (sub-id)"
         );
+    }
+
+    #[cfg(unix)]
+    mod tenant_query_loading {
+        use super::super::load_tenant_query_accounts;
+        use crate::{
+            azure::{AzureCli, AzureError},
+            model::{Subscription, TenantDescription, tenants_from_subscriptions},
+        };
+        use std::{
+            env, fs,
+            hint::black_box,
+            os::unix::fs::PermissionsExt,
+            path::PathBuf,
+            sync::{
+                Mutex, MutexGuard,
+                atomic::{AtomicU64, Ordering},
+            },
+            time::Instant,
+        };
+
+        // Serialize env override and executable creation across Unix tests in this module.
+        static FAKE_AZ_LOCK: Mutex<()> = Mutex::new(());
+
+        struct FakeAzure {
+            directory: PathBuf,
+            previous_az_bin: Option<std::ffi::OsString>,
+            _guard: MutexGuard<'static, ()>,
+        }
+
+        impl FakeAzure {
+            fn new(script_body: &str) -> Self {
+                let guard = FAKE_AZ_LOCK
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let directory = env::temp_dir().join(format!(
+                    "azc-main-tenant-query-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir(&directory).unwrap();
+                let script_path = directory.join("az");
+                fs::write(&script_path, script_body).unwrap();
+                fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+                let previous_az_bin = env::var_os("AZC_AZ_BIN");
+                // SAFETY: `FAKE_AZ_LOCK` serializes all reads/writes of `AZC_AZ_BIN` in `main::tests`,
+                // and no other unit test in the crate mutates `AZC_AZ_BIN`.
+                unsafe {
+                    env::set_var("AZC_AZ_BIN", &script_path);
+                }
+                Self {
+                    directory,
+                    previous_az_bin,
+                    _guard: guard,
+                }
+            }
+
+            fn load(
+                &self,
+                refresh: bool,
+            ) -> Result<(Vec<Subscription>, Vec<TenantDescription>), AzureError> {
+                let azure = AzureCli::from_env();
+                load_tenant_query_accounts(&azure, refresh)
+            }
+        }
+
+        impl Drop for FakeAzure {
+            fn drop(&mut self) {
+                // SAFETY: `self._guard` is still held while restoring `AZC_AZ_BIN`.
+                unsafe {
+                    match &self.previous_az_bin {
+                        Some(value) => env::set_var("AZC_AZ_BIN", value),
+                        None => env::remove_var("AZC_AZ_BIN"),
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        #[test]
+        fn direct_tenant_query_overlaps_subscription_and_tenant_loading_without_refresh() {
+            let fake = FakeAzure::new(
+                r#"#!/bin/sh
+directory=${0%/*}
+case "$*" in
+  'account list --output json --only-show-errors')
+    attempts=0
+    while [ ! -f "$directory/tenants-started" ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -gt 40 ]; then
+        echo 'ERROR: list_subscriptions ran sequentially before list_tenants started' >&2
+        exit 3
+      fi
+      sleep 0.05
+    done
+    cat <<'EOF'
+[{"id":"sub-1","name":"One","tenantId":"tenant-a","isDefault":true},{"id":"sub-2","name":"Two","tenantId":"tenant-b"}]
+EOF
+    ;;
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
+    touch "$directory/tenants-started"
+    cat <<'EOF'
+[{"tenantId":"tenant-a","displayName":"Contoso","defaultDomain":"contoso.example"}]
+EOF
+    ;;
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    touch "$directory/tenants-started"
+    cat <<'EOF'
+[{"tenantId":"tenant-b","displayName":"Fabrikam","defaultDomain":"fabrikam.example"}]
+EOF
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+            );
+
+            let (subscriptions, descriptions) = fake.load(false).unwrap();
+            let labels: Vec<String> = tenants_from_subscriptions(&subscriptions, &descriptions)
+                .iter()
+                .map(|tenant| tenant.label())
+                .collect();
+            assert_eq!(
+                labels,
+                ["Contoso (contoso.example)", "Fabrikam (fabrikam.example)"]
+            );
+        }
+
+        #[test]
+        fn direct_tenant_query_propagates_subscription_error_after_joining_tenant_thread() {
+            let fake = FakeAzure::new(
+                r#"#!/bin/sh
+directory=${0%/*}
+case "$*" in
+  'account list --output json --only-show-errors')
+    echo 'ERROR: Please run "az login" to setup account.' >&2
+    exit 1
+    ;;
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
+    sleep 0.1
+    touch "$directory/rest-finished"
+    echo '[]'
+    ;;
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    sleep 0.1
+    touch "$directory/all-finished"
+    echo '[]'
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+            );
+
+            let error = fake.load(false).unwrap_err();
+            assert!(error.to_string().contains("az login"));
+            assert!(fake.directory.join("rest-finished").exists());
+            assert!(fake.directory.join("all-finished").exists());
+        }
+
+        #[test]
+        fn direct_tenant_query_with_refresh_finishes_subscriptions_before_starting_tenants() {
+            let fake = FakeAzure::new(
+                r#"#!/bin/sh
+directory=${0%/*}
+case "$*" in
+  'account list --output json --only-show-errors --refresh')
+    sleep 0.1
+    cat <<'EOF' > "$directory/refreshed-metadata.json"
+[{"tenantId":"tenant-a","displayName":"Contoso Refreshed","defaultDomain":"contoso.example"},{"tenantId":"tenant-b","displayName":"Fabrikam Refreshed","defaultDomain":"fabrikam.example"}]
+EOF
+    touch "$directory/refresh-finished"
+    cat <<'EOF'
+[{"id":"sub-1","name":"One","tenantId":"tenant-a"},{"id":"sub-2","name":"Two","tenantId":"tenant-b","isDefault":true}]
+EOF
+    ;;
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
+    if [ ! -f "$directory/refresh-finished" ]; then
+      echo 'ERROR: rest started before --refresh finished' >&2
+      exit 3
+    fi
+    echo '[{"tenantId":"tenant-a","displayName":null,"defaultDomain":null}]'
+    ;;
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    if [ ! -f "$directory/refresh-finished" ]; then
+      echo 'ERROR: account list --all started before --refresh finished' >&2
+      exit 3
+    fi
+    cat "$directory/refreshed-metadata.json"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+            );
+
+            let (subscriptions, descriptions) = fake.load(true).unwrap();
+            let labels: Vec<String> = tenants_from_subscriptions(&subscriptions, &descriptions)
+                .iter()
+                .map(|tenant| tenant.label())
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    "Contoso Refreshed (contoso.example)",
+                    "Fabrikam Refreshed (fabrikam.example)"
+                ]
+            );
+        }
+
+        #[test]
+        #[ignore = "benchmark: cargo test --release --locked -- --ignored --nocapture bench_direct_tenant_query_account_loading"]
+        fn bench_direct_tenant_query_account_loading() {
+            let _fake = FakeAzure::new(
+                r#"#!/bin/sh
+sleep 0.15
+case "$*" in
+  'account list --output json --only-show-errors' | 'account list --output json --only-show-errors --refresh')
+    cat <<'EOF'
+[{"id":"sub-1","name":"One","tenantId":"tenant-a","isDefault":true},{"id":"sub-2","name":"Two","tenantId":"tenant-b"}]
+EOF
+    ;;
+  'rest --method get --url https://management.azure.com/tenants?api-version=2022-12-01 --query value[].{tenantId:tenantId,displayName:displayName,defaultDomain:defaultDomain} --output json')
+    cat <<'EOF'
+[{"tenantId":"tenant-a","displayName":"Contoso","defaultDomain":"contoso.example"}]
+EOF
+    ;;
+  'account list --all --query [].{tenantId:tenantId,displayName:tenantDisplayName,defaultDomain:tenantDefaultDomain} --output json --only-show-errors')
+    cat <<'EOF'
+[{"tenantId":"tenant-b","displayName":"Fabrikam","defaultDomain":"fabrikam.example"}]
+EOF
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+            );
+            let azure = AzureCli::from_env();
+
+            // Warmup
+            let _ = black_box(load_tenant_query_accounts(black_box(&azure), false).unwrap());
+
+            let runs = 5;
+            let mut samples_ms = Vec::with_capacity(runs);
+            for _ in 0..runs {
+                let start = Instant::now();
+                let loaded =
+                    load_tenant_query_accounts(black_box(&azure), black_box(false)).unwrap();
+                black_box(loaded);
+                samples_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples_ms.sort_by(|a, b| a.total_cmp(b));
+            let median_ms = samples_ms[runs / 2];
+            let mean_ms = samples_ms.iter().sum::<f64>() / runs as f64;
+            println!(
+                "bench_direct_tenant_query_account_loading (refresh=false, 150ms fake az delay): median={median_ms:.2}ms mean={mean_ms:.2}ms samples={samples_ms:.2?}"
+            );
+        }
     }
 }
