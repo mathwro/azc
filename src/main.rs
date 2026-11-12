@@ -32,93 +32,84 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn Error>> {
     let command = cli::parse(env::args_os().skip(1))?;
 
-    match command {
-        Command::Help => print!("{}", cli::help()),
-        Command::Version => println!("{}", version::Version),
-        Command::Update => match updater::update()? {
-            #[cfg(not(target_os = "windows"))]
-            updater::UpdateOutcome::Completed => println!("azc updated successfully"),
-            #[cfg(target_os = "windows")]
-            updater::UpdateOutcome::Started => {
-                println!("Cargo update started; keep this terminal open until it finishes")
-            }
-        },
-        Command::Interactive { refresh } => {
-            let azure = AzureCli::from_env();
-            if let Some(subscription) = tui::choose_subscription(azure.clone(), refresh)? {
-                if !switch_subscription(&azure, &subscription, confirm_reauthentication)? {
-                    return Ok(());
+    let azure;
+    let (selected, tenant_mode) = match command {
+        Command::Help => {
+            print!("{}", cli::help());
+            return Ok(());
+        }
+        Command::Version => {
+            println!("{}", version::Version);
+            return Ok(());
+        }
+        Command::Update => {
+            match updater::update()? {
+                #[cfg(not(target_os = "windows"))]
+                updater::UpdateOutcome::Completed => println!("azc updated successfully"),
+                #[cfg(target_os = "windows")]
+                updater::UpdateOutcome::Started => {
+                    println!("Cargo update started; keep this terminal open until it finishes")
                 }
-                println!(
-                    "Switched to {} ({}) in tenant {}",
-                    subscription.name, subscription.id, subscription.tenant_id
-                );
             }
+            return Ok(());
+        }
+        Command::Interactive { refresh } => {
+            azure = AzureCli::from_env();
+            (tui::choose_subscription(azure.clone(), refresh)?, false)
         }
         Command::Switch { query, refresh } => {
-            let azure = AzureCli::from_env();
+            azure = AzureCli::from_env();
             let subscriptions = azure.list_subscriptions(refresh)?;
-            let picked;
-            let subscription = match unique_match(&query, &subscriptions) {
-                Ok(subscription) => subscription,
-                Err(error) => {
-                    let Some(subscription) =
-                        recover_in_picker(&azure, error, subscriptions, None, query, false)?
-                    else {
-                        return Ok(());
-                    };
-                    picked = subscription;
-                    &picked
-                }
+            let selected = match unique_match(&query, &subscriptions) {
+                Ok(subscription) => Some(subscription.clone()),
+                Err(error) => recover_in_picker(&azure, error, subscriptions, None, query, false)?,
             };
-            if !switch_subscription(&azure, subscription, confirm_reauthentication)? {
-                return Ok(());
-            }
-            println!(
-                "Switched to {} ({}) in tenant {}",
-                subscription.name, subscription.id, subscription.tenant_id
-            );
+            (selected, false)
         }
         Command::Tenant { query, refresh } => {
-            let azure = AzureCli::from_env();
-            let subscription = if let Some(query) = query {
+            azure = AzureCli::from_env();
+            let selected = if let Some(query) = query {
                 let subscriptions = azure.list_subscriptions(refresh)?;
                 let descriptions = azure.list_tenants().unwrap_or_default();
                 let tenants = tenants_from_subscriptions(&subscriptions, &descriptions);
                 match unique_tenant_match(&query, &tenants) {
-                    Ok(tenant) => subscriptions[tenant.subscription_index].clone(),
-                    Err(error) => {
-                        let Some(subscription) = recover_in_picker(
-                            &azure,
-                            error,
-                            subscriptions,
-                            Some(descriptions),
-                            query,
-                            true,
-                        )?
-                        else {
-                            return Ok(());
-                        };
-                        subscription
-                    }
+                    Ok(tenant) => Some(subscriptions[tenant.subscription_index].clone()),
+                    Err(error) => recover_in_picker(
+                        &azure,
+                        error,
+                        subscriptions,
+                        Some(descriptions),
+                        query,
+                        true,
+                    )?,
                 }
             } else {
-                let Some(subscription) = tui::choose_tenant(azure.clone(), refresh)? else {
-                    return Ok(());
-                };
-                subscription
+                tui::choose_tenant(azure.clone(), refresh)?
             };
-            if !switch_subscription(&azure, &subscription, confirm_reauthentication)? {
-                return Ok(());
-            }
-            println!(
-                "Switched to tenant {} via {} ({})",
-                subscription.tenant_id, subscription.name, subscription.id
-            );
+            (selected, true)
         }
-    }
+    };
 
+    if let Some(subscription) = selected
+        && switch_subscription(&azure, &subscription, confirm_reauthentication)?
+    {
+        println!("{}", switched_message(&subscription, tenant_mode));
+    }
     Ok(())
+}
+
+fn switched_message(subscription: &Subscription, tenant_mode: bool) -> String {
+    if tenant_mode {
+        format!(
+            "Switched to tenant {} via {} ({})",
+            subscription.tenant_id, subscription.name, subscription.id
+        )
+    } else {
+        format!(
+            "Switched to {} ({}) in tenant {}",
+            subscription.name, subscription.id, subscription.tenant_id
+        )
+    }
 }
 
 fn can_open_picker() -> bool {
@@ -205,4 +196,29 @@ fn confirm_reauthentication(
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::switched_message;
+    use crate::model::Subscription;
+
+    #[test]
+    fn formats_subscription_and_tenant_switch_confirmations() {
+        let subscription = Subscription {
+            id: "sub-id".to_owned(),
+            name: "Payments".to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            is_default: false,
+        };
+
+        assert_eq!(
+            switched_message(&subscription, false),
+            "Switched to Payments (sub-id) in tenant tenant-a"
+        );
+        assert_eq!(
+            switched_message(&subscription, true),
+            "Switched to tenant tenant-a via Payments (sub-id)"
+        );
+    }
 }
