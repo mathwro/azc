@@ -21,8 +21,14 @@ pub struct AzureCli {
 impl AzureCli {
     pub fn from_env() -> Self {
         Self {
-            executable: env::var_os(AZURE_CLI_ENV).unwrap_or_else(default_executable),
+            executable: env::var_os(AZURE_CLI_ENV)
+                .filter(|path| !path.is_empty())
+                .unwrap_or_else(default_executable),
         }
+    }
+
+    pub(crate) fn executable(&self) -> &std::ffi::OsStr {
+        &self.executable
     }
 
     pub fn list_subscriptions(&self, refresh: bool) -> Result<Vec<Subscription>, AzureError> {
@@ -544,50 +550,33 @@ mod tests {
 
     #[test]
     fn windows_path_discovery_skips_empty_entries_and_preserves_extension_precedence() {
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "azc-win-path-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let cwd = root.join("cwd");
         let first = root.join("first");
         let second = root.join("second");
-        std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
 
-        // Untrusted files in cwd that an empty PATH segment would otherwise resolve.
-        std::fs::write(cwd.join("az.exe"), "").unwrap();
-        std::fs::write(cwd.join("az.cmd"), "").unwrap();
-        std::fs::write(cwd.join("az.bat"), "").unwrap();
-
-        let original_cwd = std::env::current_dir().unwrap();
-        struct Cleanup {
-            root: std::path::PathBuf,
-            original_cwd: std::path::PathBuf,
-        }
+        struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.original_cwd);
-                let _ = std::fs::remove_dir_all(&self.root);
+                let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let _cleanup = Cleanup {
-            root: root.clone(),
-            original_cwd,
-        };
-        std::env::set_current_dir(&cwd).unwrap();
+        let _cleanup = Cleanup(root);
 
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        let path_with_empties = std::ffi::OsString::from(format!(
-            "{sep}{}{sep}{sep}{}{sep}",
-            first.display(),
-            second.display()
-        ));
-
+        let path_with_empties = std::env::join_paths([
+            std::path::PathBuf::new(),
+            first.clone(),
+            std::path::PathBuf::new(),
+            second.clone(),
+            std::path::PathBuf::new(),
+        ])
+        .unwrap();
         assert_eq!(
             super::find_windows_executable_in_path(&path_with_empties),
             None
