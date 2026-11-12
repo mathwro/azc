@@ -9,20 +9,24 @@ pub struct MatchScore(u8);
 trait Candidate {
     /// Noun used in "no <kind> matches" errors.
     const KIND: &'static str;
-    const SCORE: fn(&str, &[&str], &Self) -> Option<MatchScore>;
 
     /// Display name and current flag used to break score ties.
     fn tie_break(&self) -> (&str, bool);
+    /// Scores a candidate against a pre-lowercased query and lowercased name.
+    fn score(&self, query: &str, fragments: &[&str], name_lower: &str) -> Option<MatchScore>;
     /// Label listed in ambiguity errors.
     fn describe(&self) -> String;
 }
 
 impl Candidate for Subscription {
     const KIND: &'static str = "subscription";
-    const SCORE: fn(&str, &[&str], &Self) -> Option<MatchScore> = score;
 
     fn tie_break(&self) -> (&str, bool) {
         (&self.name, self.is_default)
+    }
+
+    fn score(&self, query: &str, fragments: &[&str], name_lower: &str) -> Option<MatchScore> {
+        score(query, fragments, name_lower, self)
     }
 
     fn describe(&self) -> String {
@@ -32,10 +36,13 @@ impl Candidate for Subscription {
 
 impl Candidate for Tenant {
     const KIND: &'static str = "tenant";
-    const SCORE: fn(&str, &[&str], &Self) -> Option<MatchScore> = score_tenant;
 
     fn tie_break(&self) -> (&str, bool) {
         (&self.name, self.is_current)
+    }
+
+    fn score(&self, query: &str, fragments: &[&str], name_lower: &str) -> Option<MatchScore> {
+        score_tenant(query, fragments, name_lower, self)
     }
 
     fn describe(&self) -> String {
@@ -85,9 +92,14 @@ fn matches<T: Candidate>(query: &str, items: &[T]) -> Vec<(usize, MatchScore)> {
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
-            let score = T::SCORE(&query, &fragments, item)?;
             let (name, is_current) = item.tie_break();
-            Some((score, !is_current, name.to_lowercase(), index))
+            let name_lower = name.to_lowercase();
+            let score = if query.is_empty() {
+                MatchScore(u8::from(!is_current))
+            } else {
+                item.score(&query, &fragments, &name_lower)?
+            };
+            Some((score, !is_current, name_lower, index))
         })
         .collect::<Vec<_>>();
     matches.sort_unstable();
@@ -121,19 +133,19 @@ fn unique<'a, T: Candidate>(query: &str, items: &'a [T]) -> Result<&'a T, MatchE
     })
 }
 
-fn score_tenant(query: &str, fragments: &[&str], tenant: &Tenant) -> Option<MatchScore> {
-    if query.is_empty() {
-        return Some(if tenant.is_current {
-            MatchScore(0)
-        } else {
-            MatchScore(1)
-        });
+fn score_tenant(
+    query: &str,
+    fragments: &[&str],
+    name: &str,
+    tenant: &Tenant,
+) -> Option<MatchScore> {
+    if name == query {
+        return Some(MatchScore(0));
     }
 
-    let name = tenant.name.to_lowercase();
     let id = tenant.id.to_lowercase();
     let domain = tenant.default_domain.to_lowercase();
-    if name == query || domain == query || id == query {
+    if domain == query || id == query {
         Some(MatchScore(0))
     } else if name.starts_with(query) || domain.starts_with(query) || id.starts_with(query) {
         Some(MatchScore(1))
@@ -159,20 +171,18 @@ fn name_fragments(query: &str) -> Vec<&str> {
     terms
 }
 
-fn score(query: &str, fragments: &[&str], subscription: &Subscription) -> Option<MatchScore> {
-    if query.is_empty() {
-        return Some(if subscription.is_default {
-            MatchScore(0)
-        } else {
-            MatchScore(1)
-        });
+fn score(
+    query: &str,
+    fragments: &[&str],
+    name: &str,
+    subscription: &Subscription,
+) -> Option<MatchScore> {
+    if name == query {
+        return Some(MatchScore(0));
     }
 
-    let name = subscription.name.to_lowercase();
     let id = subscription.id.to_lowercase();
-    let tenant_id = subscription.tenant_id.to_lowercase();
-
-    if name == query || id == query {
+    if id == query {
         Some(MatchScore(0))
     } else if name.starts_with(query) {
         Some(MatchScore(1))
@@ -183,7 +193,7 @@ fn score(query: &str, fragments: &[&str], subscription: &Subscription) -> Option
         Some(MatchScore(2))
     } else if name.contains(query) {
         Some(MatchScore(3))
-    } else if id.contains(query) || tenant_id.contains(query) {
+    } else if id.contains(query) || subscription.tenant_id.to_lowercase().contains(query) {
         Some(MatchScore(4))
     } else if !fragments.is_empty() && fragments.iter().all(|fragment| name.contains(*fragment)) {
         Some(MatchScore(5))
@@ -551,6 +561,24 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "no subscription matches 'south'"
+        );
+    }
+
+    #[test]
+    fn matches_and_sorts_unicode_names_case_insensitively() {
+        let subscriptions = vec![
+            subscription("Zażółć Dev", "1", false),
+            subscription("zażółć alpha", "2", false),
+            subscription("Équipe Prod", "3", false),
+        ];
+
+        assert_eq!(ranked_indices("ZAŻÓŁĆ", &subscriptions), [1, 0]);
+        assert_eq!(ranked_indices("équipe", &subscriptions), [2]);
+        assert_eq!(ranked_indices("", &subscriptions), [1, 0, 2]);
+
+        assert_eq!(
+            super::Candidate::score(&subscriptions[0], "zażółć", &[], "zażółć dev"),
+            Some(super::MatchScore(1))
         );
     }
 }

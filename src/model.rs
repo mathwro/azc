@@ -71,16 +71,15 @@ pub fn tenants_from_subscriptions(
     let mut tenants: Vec<Tenant> = Vec::new();
 
     for (subscription_index, subscription) in subscriptions.iter().enumerate() {
-        if subscription.tenant_id.is_empty() {
+        let tenant_id = subscription.tenant_id.trim();
+        if tenant_id.is_empty() {
             continue;
         }
 
-        if let Some(tenant) = tenants.iter_mut().find(|tenant| {
-            tenant
-                .id
-                .trim()
-                .eq_ignore_ascii_case(subscription.tenant_id.trim())
-        }) {
+        if let Some(tenant) = tenants
+            .iter_mut()
+            .find(|tenant| tenant.id.eq_ignore_ascii_case(tenant_id))
+        {
             tenant.subscription_count += 1;
             if subscription.is_default {
                 tenant.is_current = true;
@@ -89,10 +88,7 @@ pub fn tenants_from_subscriptions(
         } else {
             let matching = || {
                 descriptions.iter().filter(|description| {
-                    description
-                        .tenant_id
-                        .trim()
-                        .eq_ignore_ascii_case(subscription.tenant_id.trim())
+                    description.tenant_id.trim().eq_ignore_ascii_case(tenant_id)
                 })
             };
             let default_domain = matching()
@@ -105,7 +101,7 @@ pub fn tenants_from_subscriptions(
                 .unwrap_or(&default_domain)
                 .to_owned();
             tenants.push(Tenant {
-                id: subscription.tenant_id.clone(),
+                id: tenant_id.to_owned(),
                 name,
                 default_domain,
                 subscription_index,
@@ -197,6 +193,42 @@ mod tenant_tests {
         assert_eq!(
             tenants_from_subscriptions(&subscriptions, &descriptions)[0].name,
             "tenant-a.example"
+        );
+    }
+
+    #[test]
+    fn skips_whitespace_tenant_ids_and_trims_stored_tenant_id() {
+        let subscriptions = vec![
+            Subscription {
+                id: "blank".to_owned(),
+                name: "Blank Tenant".to_owned(),
+                tenant_id: "   \t\n ".to_owned(),
+                is_default: false,
+            },
+            Subscription {
+                id: "first".to_owned(),
+                name: "First".to_owned(),
+                tenant_id: " Tenant-A ".to_owned(),
+                is_default: false,
+            },
+            Subscription {
+                id: "second".to_owned(),
+                name: "Second".to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                is_default: true,
+            },
+        ];
+
+        assert_eq!(
+            tenants_from_subscriptions(&subscriptions, &[]),
+            vec![super::Tenant {
+                id: "Tenant-A".to_owned(),
+                name: String::new(),
+                default_domain: String::new(),
+                subscription_index: 2,
+                subscription_count: 2,
+                is_current: true,
+            }]
         );
     }
 }
